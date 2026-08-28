@@ -332,7 +332,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.0",
+        version: "0.9.1",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -474,6 +474,10 @@ app.get(
                 calendarDatabase.events,
             notes:
                 calendarDatabase.notes,
+            owner: {
+                playerId: CALENDAR_OWNER_ID,
+                name: "RobertHarvey"
+            },
             editors:
                 calendarDatabase.editors
         });
