@@ -1,15 +1,11 @@
 {
-  "name": "micc-status-server",
-  "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "name": "micc-faction-status",
+  "version": "0.8.0",
+  "description": "MICC Faction Status Relay",
+  "main": "server.cjs",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.cjs"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "dependencies": {
     "express": "^5.2.1"
   }
