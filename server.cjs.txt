@@ -1,0 +1,161 @@
+const express = require("express");
+const fs = require("fs");
+const path = require("path");
+
+const app = express();
+
+const PORT = process.env.PORT || 3002;
+const MICC_SECRET =
+    process.env.MICC_SECRET ||
+    "MICC-r8K42-xP91-2026";
+
+const DATA_FILE = path.join(__dirname, "micc-status.json");
+const MAX_STATUS_AGE = 24 * 60 * 60 * 1000;
+
+app.use(express.json());
+
+app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    res.setHeader(
+        "Access-Control-Allow-Headers",
+        "Content-Type, X-MICC-Secret"
+    );
+    res.setHeader(
+        "Access-Control-Allow-Methods",
+        "GET, POST, OPTIONS"
+    );
+
+    if (req.method === "OPTIONS") {
+        return res.sendStatus(204);
+    }
+
+    next();
+});
+
+function loadDatabase() {
+    try {
+        if (!fs.existsSync(DATA_FILE)) {
+            return {};
+        }
+
+        const raw = fs.readFileSync(DATA_FILE, "utf8");
+
+        if (!raw.trim()) {
+            return {};
+        }
+
+        return JSON.parse(raw);
+    } catch (error) {
+        console.error("[MICC] Database load error:", error);
+        return {};
+    }
+}
+
+let database = loadDatabase();
+
+function saveDatabase() {
+    try {
+        fs.writeFileSync(
+            DATA_FILE,
+            JSON.stringify(database, null, 2)
+        );
+    } catch (error) {
+        console.error("[MICC] Database save error:", error);
+    }
+}
+
+function auth(req, res, next) {
+    const supplied = req.headers["x-micc-secret"];
+
+    if (!supplied || supplied !== MICC_SECRET) {
+        return res.status(403).json({
+            success: false,
+            error: "Invalid MICC secret"
+        });
+    }
+
+    next();
+}
+
+app.get("/", (req, res) => {
+    res.json({
+        success: true,
+        service: "MICC Faction Status Relay",
+        version: "0.7.2",
+        members: Object.keys(database).length
+    });
+});
+
+app.post("/api/micc/status", auth, (req, res) => {
+    const {
+        playerId,
+        name,
+        energy,
+        energyMax,
+        drug,
+        booster
+    } = req.body || {};
+
+    if (!playerId || !name) {
+        return res.status(400).json({
+            success: false,
+            error: "Missing playerId or name"
+        });
+    }
+
+    const id = String(playerId);
+
+    database[id] = {
+        playerId: Number(playerId),
+        name: String(name),
+        energy: Number(energy) || 0,
+        energyMax: Number(energyMax) || 0,
+        drug: Number(drug) || 0,
+        booster: Number(booster) || 0,
+        updated: Date.now()
+    };
+
+    saveDatabase();
+
+    console.log(`[MICC] Updated ${name} [${playerId}]`);
+
+    res.json({
+        success: true
+    });
+});
+
+app.get("/api/micc/status", auth, (req, res) => {
+    const now = Date.now();
+    let changed = false;
+
+    for (const [id, member] of Object.entries(database)) {
+        if (
+            !member.updated ||
+            now - member.updated > MAX_STATUS_AGE
+        ) {
+            delete database[id];
+            changed = true;
+        }
+    }
+
+    if (changed) {
+        saveDatabase();
+    }
+
+    res.json({
+        success: true,
+        members: Object.values(database)
+    });
+});
+
+app.listen(PORT, () => {
+    console.log("");
+    console.log("===============================");
+    console.log(" MICC Faction Status Relay");
+    console.log("===============================");
+    console.log("");
+    console.log(`Running on http://localhost:${PORT}`);
+    console.log("");
+    console.log("MICC, Made by RobertHarvey.");
+    console.log("");
+});

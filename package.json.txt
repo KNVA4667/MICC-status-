@@ -1,0 +1,12 @@
+{
+  "name": "micc-faction-status",
+  "version": "0.8.0",
+  "description": "MICC Faction Status Relay",
+  "main": "server.cjs",
+  "scripts": {
+    "start": "node server.cjs"
+  },
+  "dependencies": {
+    "express": "^5.1.0"
+  }
+}
