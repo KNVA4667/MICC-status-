@@ -1166,6 +1166,79 @@ function normalizeArmoryIncomingItem(item) {
                 .slice(0, 300)
             : [];
 
+    const rwDetails =
+        Array.isArray(item?.rwDetails)
+            ? item.rwDetails
+                .map(detail => {
+                    const bonuses =
+                        Array.isArray(detail?.bonuses)
+                            ? detail.bonuses
+                                .map(bonus => ({
+                                    id:
+                                        Number(bonus?.id || 0) || 0,
+                                    title:
+                                        String(bonus?.title || "")
+                                            .trim()
+                                            .slice(0, 80),
+                                    description:
+                                        String(bonus?.description || "")
+                                            .trim()
+                                            .slice(0, 240),
+                                    value:
+                                        Number.isFinite(Number(bonus?.value))
+                                            ? Number(bonus.value)
+                                            : null
+                                }))
+                                .filter(
+                                    bonus =>
+                                        bonus.title ||
+                                        bonus.description
+                                )
+                                .slice(0, 8)
+                            : [];
+
+                    if (!bonuses.length) {
+                        return null;
+                    }
+
+                    return {
+                        uid:
+                            String(detail?.uid || "")
+                                .trim()
+                                .slice(0, 80),
+                        name:
+                            String(detail?.name || "")
+                                .trim()
+                                .slice(0, 100),
+                        subType:
+                            String(detail?.subType || "")
+                                .trim()
+                                .slice(0, 80),
+                        rarity:
+                            String(detail?.rarity || "")
+                                .trim()
+                                .slice(0, 30),
+                        stats: {
+                            damage:
+                                Number.isFinite(Number(detail?.stats?.damage))
+                                    ? Number(detail.stats.damage)
+                                    : null,
+                            accuracy:
+                                Number.isFinite(Number(detail?.stats?.accuracy))
+                                    ? Number(detail.stats.accuracy)
+                                    : null,
+                            quality:
+                                Number.isFinite(Number(detail?.stats?.quality))
+                                    ? Number(detail.stats.quality)
+                                    : null
+                        },
+                        bonuses
+                    };
+                })
+                .filter(Boolean)
+                .slice(0, 300)
+            : [];
+
     const loaned =
         item?.loaned &&
         typeof item.loaned ===
@@ -1205,6 +1278,7 @@ function normalizeArmoryIncomingItem(item) {
         amount,
         uids,
         rwUids,
+        rwDetails,
         loaned
     };
 }
@@ -1422,10 +1496,29 @@ function getArmoryItemAmounts(snapshot) {
     return map;
 }
 
-function getArmoryLowStock(snapshot) {
+function getArmoryLowStock(
+    snapshot,
+    usage = null
+) {
     const items =
         getArmoryItemAmounts(
             snapshot
+        );
+
+    const usedKeys =
+        new Set(
+            Array.isArray(usage?.items)
+                ? usage.items
+                    .filter(
+                        item =>
+                            Number(item?.used || 0) > 0
+                    )
+                    .map(
+                        item =>
+                            String(item?.key || "")
+                    )
+                    .filter(Boolean)
+                : []
         );
 
     const lows = [];
@@ -1444,6 +1537,17 @@ function getArmoryLowStock(snapshot) {
                 .trim()
                 .toLowerCase();
 
+        // Restock warnings are intentionally limited to consumables.
+        if (
+            ![
+                "drugs",
+                "medical",
+                "temporary"
+            ].includes(category)
+        ) {
+            continue;
+        }
+
         let threshold = null;
 
         if (
@@ -1452,18 +1556,26 @@ function getArmoryLowStock(snapshot) {
         ) {
             threshold = 100;
         } else if (
-            category === "medical" &&
-            name === "first aid kit"
+            usedKeys.has(entry.key)
         ) {
-            threshold = 200;
-        } else if (
-            category === "medical"
-        ) {
-            threshold = 50;
-        } else if (
-            category === "temporary"
-        ) {
-            threshold = 25;
+            if (
+                category === "medical" &&
+                name === "first aid kit"
+            ) {
+                threshold = 200;
+            } else if (
+                category === "medical"
+            ) {
+                threshold = 50;
+            } else if (
+                category === "temporary"
+            ) {
+                threshold = 25;
+            } else if (
+                category === "drugs"
+            ) {
+                threshold = 25;
+            }
         }
 
         if (
@@ -1473,6 +1585,7 @@ function getArmoryLowStock(snapshot) {
             lows.push({
                 key: entry.key,
                 label: entry.name,
+                category,
                 current:
                     entry.amount,
                 threshold,
@@ -1483,45 +1596,6 @@ function getArmoryLowStock(snapshot) {
                         : 1
             });
         }
-    }
-
-    const metrics =
-        getArmoryMetrics(
-            snapshot
-        );
-
-    if (
-        metrics.rwAvailable < 3
-    ) {
-        lows.push({
-            key:
-                "group:rwAvailable",
-            label:
-                "Available RW weapons",
-            current:
-                metrics.rwAvailable,
-            threshold: 3,
-            ratio:
-                metrics.rwAvailable /
-                3
-        });
-    }
-
-    if (
-        metrics.armorAvailable < 10
-    ) {
-        lows.push({
-            key:
-                "group:armorAvailable",
-            label:
-                "Available armor",
-            current:
-                metrics.armorAvailable,
-            threshold: 10,
-            ratio:
-                metrics.armorAvailable /
-                10
-        });
     }
 
     return lows.sort(
@@ -1654,6 +1728,206 @@ function buildArmoryRecentChanges(
     );
 }
 
+function buildArmoryConsumableUsage(
+    snapshots
+) {
+    // Faction-side only:
+    // compares consecutive faction inventory snapshots and measures
+    // observed stock leaving / entering the faction armory.
+    const validCategories =
+        new Set([
+            "drugs",
+            "medical",
+            "temporary"
+        ]);
+
+    const ordered =
+        (Array.isArray(snapshots)
+            ? snapshots
+            : []
+        )
+            .slice()
+            .sort(
+                (a, b) =>
+                    Number(a?.ts || 0) -
+                    Number(b?.ts || 0)
+            );
+
+    const flowByKey =
+        new Map();
+
+    for (
+        let index = 1;
+        index < ordered.length;
+        index += 1
+    ) {
+        const previous =
+            getArmoryItemAmounts(
+                ordered[index - 1]
+            );
+
+        const current =
+            getArmoryItemAmounts(
+                ordered[index]
+            );
+
+        const keys =
+            new Set([
+                ...previous.keys(),
+                ...current.keys()
+            ]);
+
+        for (const key of keys) {
+            const before =
+                previous.get(key);
+
+            const after =
+                current.get(key);
+
+            const category =
+                String(
+                    after?.category ||
+                    before?.category ||
+                    ""
+                )
+                    .trim()
+                    .toLowerCase();
+
+            if (
+                !validCategories.has(
+                    category
+                )
+            ) {
+                continue;
+            }
+
+            const beforeAmount =
+                Math.max(
+                    0,
+                    Number(before?.amount || 0) || 0
+                );
+
+            const afterAmount =
+                Math.max(
+                    0,
+                    Number(after?.amount || 0) || 0
+                );
+
+            const delta =
+                afterAmount -
+                beforeAmount;
+
+            if (!delta) {
+                continue;
+            }
+
+            const existing =
+                flowByKey.get(key) || {
+                    key,
+                    id:
+                        Number(
+                            after?.id ||
+                            before?.id ||
+                            0
+                        ) || 0,
+                    name:
+                        String(
+                            after?.name ||
+                            before?.name ||
+                            key
+                        ),
+                    category,
+                    used: 0,
+                    added: 0
+                };
+
+            if (delta < 0) {
+                // Observed stock leaving the faction armory.
+                existing.used +=
+                    Math.abs(delta);
+            } else {
+                // Observed stock being added / restocked into faction armory.
+                existing.added +=
+                    delta;
+            }
+
+            flowByKey.set(
+                key,
+                existing
+            );
+        }
+    }
+
+    const items =
+        [...flowByKey.values()]
+            .sort(
+                (a, b) =>
+                    Number(b.used || 0) -
+                    Number(a.used || 0) ||
+                    Number(b.added || 0) -
+                    Number(a.added || 0) ||
+                    a.name.localeCompare(b.name)
+            );
+
+    const categories = {
+        drugs: 0,
+        medical: 0,
+        temporary: 0
+    };
+
+    const addedCategories = {
+        drugs: 0,
+        medical: 0,
+        temporary: 0
+    };
+
+    for (const item of items) {
+        if (
+            Object.prototype.hasOwnProperty.call(
+                categories,
+                item.category
+            )
+        ) {
+            categories[item.category] +=
+                Math.max(
+                    0,
+                    Number(item.used || 0) || 0
+                );
+
+            addedCategories[item.category] +=
+                Math.max(
+                    0,
+                    Number(item.added || 0) || 0
+                );
+        }
+    }
+
+    const spanMs =
+        ordered.length >= 2
+            ? Math.max(
+                0,
+                Number(
+                    ordered[
+                        ordered.length - 1
+                    ]?.ts || 0
+                ) -
+                Number(
+                    ordered[0]?.ts || 0
+                )
+            )
+            : 0;
+
+    return {
+        snapshotCount:
+            ordered.length,
+        spanMs,
+        categories,
+        addedCategories,
+        items
+    };
+}
+
+
 function median(values) {
     const nums =
         values
@@ -1700,10 +1974,16 @@ function buildArmoryAlerts(
         return alerts;
     }
 
+    const usage =
+        buildArmoryConsumableUsage(
+            snapshots
+        );
+
     for (
         const low
         of getArmoryLowStock(
-            latest
+            latest,
+            usage
         )
     ) {
         alerts.push({
@@ -2044,10 +2324,22 @@ function buildArmoryInventoryRows(snapshot) {
                     ),
                 rwCount:
                     Array.isArray(
-                        item.rwUids
+                        item.rwDetails
                     )
-                        ? item.rwUids.length
-                        : 0,
+                        ? item.rwDetails.filter(
+                            detail =>
+                                Array.isArray(detail?.bonuses) &&
+                                detail.bonuses.length > 0
+                        ).length
+                        : (
+                            Array.isArray(item.rwUids)
+                                ? item.rwUids.length
+                                : 0
+                        ),
+                rwDetails:
+                    Array.isArray(item.rwDetails)
+                        ? item.rwDetails
+                        : [],
                 loanedTo:
                     item?.loaned?.name ||
                     ""
@@ -2214,7 +2506,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.7",
+        version: "0.9.9",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -3716,6 +4008,21 @@ app.get(
                 lowStock: [],
                 recentChanges: [],
                 alerts: [],
+                usage: {
+                    snapshotCount: 0,
+                    spanMs: 0,
+                    categories: {
+                        drugs: 0,
+                        medical: 0,
+                        temporary: 0
+                    },
+                    addedCategories: {
+                        drugs: 0,
+                        medical: 0,
+                        temporary: 0
+                    },
+                    items: []
+                },
                 history: [],
                 forecast: {
                     xanax: {
@@ -3785,6 +4092,11 @@ app.get(
                 })
             );
 
+        const usage =
+            buildArmoryConsumableUsage(
+                snapshots
+            );
+
         res.json({
             success: true,
             days,
@@ -3811,13 +4123,15 @@ app.get(
             },
             lowStock:
                 getArmoryLowStock(
-                    latest
+                    latest,
+                    usage
                 ),
             recentChanges:
                 buildArmoryRecentChanges(
                     latest,
                     previous
                 ),
+            usage,
             alerts:
                 buildArmoryAlerts(
                     snapshots,
