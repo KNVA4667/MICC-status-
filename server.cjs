@@ -2512,7 +2512,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.10",
+        version: "0.9.11",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -3810,48 +3810,73 @@ function parseFactionArmoryUseNews(entry) {
         return null;
     }
 
-    // Current Torn faction armory usage wording:
-    // "Player used one of the faction's Xanax items"
-    // Also tolerate explicit quantities if Torn changes wording.
-    let match =
-        text.match(
-            /^(.+?)\s+used\s+one\s+of\s+the\s+faction['’]s\s+(.+?)\s+items?\.?$/i
-        );
+    // Deliberately count ONLY faction armory "used" actions.
+    // Never count gave, loaned, retrieved, filled, donated or deposited events.
+    // Torn exposes faction news as human-readable messages, so tolerate the
+    // common singular/plural wording while requiring the word "used".
+    const patterns = [
+        /^(.+?)\s+used\s+one\s+of\s+the\s+faction['’]s\s+(.+?)\s+items?\.?$/i,
+        /^(.+?)\s+used\s+([\d,]+)\s+of\s+the\s+faction['’]s\s+(.+?)\s+items?\.?$/i,
+        /^(.+?)\s+used\s+an?\s+(.+?)\s+from\s+the\s+faction\s+armou?r(?:y)?\.?$/i,
+        /^(.+?)\s+used\s+([\d,]+)\s+(.+?)\s+from\s+the\s+faction\s+armou?r(?:y)?\.?$/i
+    ];
 
-    let quantity = 1;
     let actor = "";
     let itemName = "";
+    let quantity = 1;
+
+    let match =
+        text.match(patterns[0]);
 
     if (match) {
-        actor =
-            String(match[1] || "").trim();
-        itemName =
-            String(match[2] || "").trim();
+        actor = String(match[1] || "").trim();
+        itemName = String(match[2] || "").trim();
     } else {
-        match =
-            text.match(
-                /^(.+?)\s+used\s+([\d,]+)\s+of\s+the\s+faction['’]s\s+(.+?)\s+items?\.?$/i
-            );
+        match = text.match(patterns[1]);
 
-        if (!match) {
-            return null;
+        if (match) {
+            actor = String(match[1] || "").trim();
+            quantity =
+                Math.max(
+                    1,
+                    Number(
+                        String(match[2] || "1")
+                            .replace(/,/g, "")
+                    ) || 1
+                );
+            itemName = String(match[3] || "").trim();
+        } else {
+            match = text.match(patterns[2]);
+
+            if (match) {
+                actor = String(match[1] || "").trim();
+                itemName = String(match[2] || "").trim();
+            } else {
+                match = text.match(patterns[3]);
+
+                if (!match) {
+                    return null;
+                }
+
+                actor = String(match[1] || "").trim();
+                quantity =
+                    Math.max(
+                        1,
+                        Number(
+                            String(match[2] || "1")
+                                .replace(/,/g, "")
+                        ) || 1
+                    );
+                itemName = String(match[3] || "").trim();
+            }
         }
-
-        actor =
-            String(match[1] || "").trim();
-
-        quantity =
-            Math.max(
-                1,
-                Number(
-                    String(match[2] || "1")
-                        .replace(/,/g, "")
-                ) || 1
-            );
-
-        itemName =
-            String(match[3] || "").trim();
     }
+
+    itemName =
+        itemName
+            .replace(/\s+items?$/i, "")
+            .replace(/[.]+$/, "")
+            .trim();
 
     if (
         !itemName ||
@@ -3871,6 +3896,7 @@ function parseFactionArmoryUseNews(entry) {
         text
     };
 }
+
 
 function latestArmoryCategoryMap() {
     const snapshots =
@@ -4037,6 +4063,112 @@ async function fetchTornFactionNewsPage({
     return data || {};
 }
 
+async function fetchTornFactionNewsUrl(
+    rawUrl
+) {
+    const url =
+        new URL(rawUrl);
+
+    // Never trust / expose a key embedded in Torn's returned pagination URL.
+    // Re-apply the private server-side key.
+    url.searchParams.set(
+        "key",
+        TORN_FACTION_API_KEY
+    );
+
+    // Keep the requested representation stable even if a returned pagination
+    // link changes stripTags (a Torn pagination issue reported in 2026).
+    url.searchParams.set(
+        "stripTags",
+        "true"
+    );
+
+    const response =
+        await fetch(
+            url,
+            {
+                method: "GET",
+                headers: {
+                    "Accept":
+                        "application/json"
+                }
+            }
+        );
+
+    let data = null;
+
+    try {
+        data =
+            await response.json();
+    } catch {
+        data = null;
+    }
+
+    if (!response.ok) {
+        const error =
+            new Error(
+                data?.error?.error ||
+                data?.error ||
+                data?.message ||
+                `Torn HTTP ${response.status}`
+            );
+
+        error.status =
+            response.status;
+        error.tornData =
+            data;
+
+        throw error;
+    }
+
+    if (data?.error) {
+        const error =
+            new Error(
+                data?.error?.error ||
+                data?.error?.message ||
+                "Torn API error"
+            );
+
+        error.tornData =
+            data;
+
+        throw error;
+    }
+
+    return data || {};
+}
+
+function getTornNextNewsUrl(data) {
+    const candidate =
+        data?._metadata?.links?.next ??
+        data?.metadata?.links?.next ??
+        data?._metadata?.next ??
+        data?.links?.next ??
+        null;
+
+    if (
+        !candidate ||
+        typeof candidate !== "string"
+    ) {
+        return null;
+    }
+
+    try {
+        const parsed =
+            new URL(candidate);
+
+        if (
+            parsed.hostname !== "api.torn.com"
+        ) {
+            return null;
+        }
+
+        return parsed.toString();
+    } catch {
+        return null;
+    }
+}
+
 async function fetchFactionArmoryUseHistory(
     days
 ) {
@@ -4052,27 +4184,78 @@ async function fetchFactionArmoryUseHistory(
         60 *
         60;
 
-    const seen =
+    const initialUrl =
+        new URL(
+            "https://api.torn.com/v2/faction/news"
+        );
+
+    initialUrl.searchParams.set(
+        "cat",
+        "armoryAction"
+    );
+    initialUrl.searchParams.set(
+        "limit",
+        "100"
+    );
+    initialUrl.searchParams.set(
+        "sort",
+        "asc"
+    );
+    initialUrl.searchParams.set(
+        "from",
+        String(start)
+    );
+    initialUrl.searchParams.set(
+        "to",
+        String(end)
+    );
+    initialUrl.searchParams.set(
+        "stripTags",
+        "true"
+    );
+
+    const seenEventIds =
+        new Set();
+
+    const seenPageUrls =
         new Set();
 
     const rows = [];
 
-    let cursor =
-        start;
+    let nextUrl =
+        initialUrl.toString();
 
-    // Safety cap: 30 days of a normal faction should be far below this.
     for (
         let page = 0;
-        page < 250;
+        page < 500 && nextUrl;
         page += 1
     ) {
+        const normalizedPage =
+            new URL(nextUrl);
+
+        normalizedPage.searchParams.delete(
+            "key"
+        );
+
+        const pageIdentity =
+            normalizedPage.toString();
+
+        if (
+            seenPageUrls.has(
+                pageIdentity
+            )
+        ) {
+            break;
+        }
+
+        seenPageUrls.add(
+            pageIdentity
+        );
+
         const data =
-            await fetchTornFactionNewsPage({
-                from: cursor,
-                to: end,
-                limit: 100,
-                sort: "asc"
-            });
+            await fetchTornFactionNewsUrl(
+                nextUrl
+            );
 
         const news =
             Array.isArray(data?.news)
@@ -4084,71 +4267,61 @@ async function fetchFactionArmoryUseHistory(
                         : []
                 );
 
-        if (!news.length) {
-            break;
-        }
-
-        let maxTimestamp =
-            cursor;
-
-        let addedThisPage =
-            0;
-
         for (const entry of news) {
-            const id =
-                String(
-                    entry?.id ||
-                    `${entry?.timestamp || 0}:${entry?.text || entry?.news || ""}`
-                );
+            const timestamp =
+                Number(
+                    entry?.timestamp || 0
+                ) || 0;
 
-            maxTimestamp =
-                Math.max(
-                    maxTimestamp,
-                    Number(entry?.timestamp || 0) || 0
-                );
-
-            if (seen.has(id)) {
+            // Preserve the user's exact requested date window even if Torn's
+            // pagination link accidentally drops one of the original bounds.
+            if (
+                timestamp < start ||
+                timestamp > end
+            ) {
                 continue;
             }
 
-            seen.add(id);
+            const id =
+                String(
+                    entry?.id ||
+                    `${timestamp}:${entry?.text || entry?.news || ""}`
+                );
+
+            // Torn pagination can repeat the boundary record.
+            if (
+                seenEventIds.has(id)
+            ) {
+                continue;
+            }
+
+            seenEventIds.add(id);
             rows.push(entry);
-            addedThisPage += 1;
         }
 
-        if (
-            news.length < 100 ||
-            maxTimestamp >= end
-        ) {
-            break;
-        }
-
-        // Torn pagination can repeat the boundary item.
-        // Advance one second and deduplicate IDs.
-        const nextCursor =
-            Math.max(
-                cursor + 1,
-                maxTimestamp + 1
+        nextUrl =
+            getTornNextNewsUrl(
+                data
             );
-
-        if (nextCursor <= cursor) {
-            break;
-        }
-
-        cursor =
-            nextCursor;
-
-        if (!addedThisPage) {
-            break;
-        }
     }
+
+    rows.sort(
+        (a, b) =>
+            Number(a?.timestamp || 0) -
+            Number(b?.timestamp || 0)
+    );
 
     return {
         start,
         end,
-        news: rows
+        news: rows,
+        uniqueNewsCount:
+            rows.length,
+        pageCount:
+            seenPageUrls.size
     };
 }
+
 
 app.get(
     "/api/micc/armory/news-usage",
@@ -4316,6 +4489,8 @@ app.get(
                     history.end,
                 rawNewsCount:
                     history.news.length,
+                pagesRead:
+                    history.pageCount || 0,
                 parsedUseEvents:
                     parsed.length,
                 totalUsed,
