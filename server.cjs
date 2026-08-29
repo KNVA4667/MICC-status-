@@ -1479,6 +1479,169 @@ function buildArmoryAlerts(
     return alerts;
 }
 
+
+function buildArmoryForecast(
+    snapshots
+) {
+    const safeSnapshots =
+        Array.isArray(snapshots)
+            ? snapshots
+            : [];
+
+    if (!safeSnapshots.length) {
+        return {
+            xanax: {
+                ready: false,
+                consumptionPerDay: 0,
+                daysRemaining: null,
+                recommendedRestock: 0,
+                targetStock: 500
+            }
+        };
+    }
+
+    const firstTs =
+        Number(
+            safeSnapshots[0]?.ts ||
+            0
+        );
+
+    const lastTs =
+        Number(
+            safeSnapshots[
+                safeSnapshots.length - 1
+            ]?.ts || 0
+        );
+
+    const spanMs =
+        Math.max(
+            0,
+            lastTs - firstTs
+        );
+
+    const ready =
+        safeSnapshots.length >= 6 &&
+        spanMs >=
+            5 *
+            60 *
+            60 *
+            1000;
+
+    const xanaxValues =
+        safeSnapshots.map(
+            snapshot => {
+                const metrics =
+                    getArmoryMetrics(
+                        snapshot
+                    );
+
+                return {
+                    ts:
+                        Number(
+                            snapshot?.ts ||
+                            0
+                        ),
+                    value:
+                        Number(
+                            metrics?.xanax ||
+                            0
+                        )
+                };
+            }
+        );
+
+    let observedConsumption = 0;
+
+    for (
+        let index = 1;
+        index < xanaxValues.length;
+        index += 1
+    ) {
+        const previous =
+            xanaxValues[index - 1]
+                .value;
+
+        const current =
+            xanaxValues[index]
+                .value;
+
+        if (
+            current < previous
+        ) {
+            observedConsumption +=
+                previous - current;
+        }
+    }
+
+    const spanDays =
+        spanMs > 0
+            ? spanMs /
+                (
+                    24 *
+                    60 *
+                    60 *
+                    1000
+                )
+            : 0;
+
+    const consumptionPerDay =
+        ready &&
+        spanDays > 0
+            ? observedConsumption /
+                spanDays
+            : 0;
+
+    const latestXanax =
+        xanaxValues[
+            xanaxValues.length - 1
+        ]?.value || 0;
+
+    const daysRemaining =
+        ready &&
+        consumptionPerDay > 0
+            ? latestXanax /
+                consumptionPerDay
+            : null;
+
+    const targetStock = 500;
+
+    const recommendedRestock =
+        ready
+            ? Math.max(
+                0,
+                targetStock -
+                latestXanax
+            )
+            : 0;
+
+    return {
+        xanax: {
+            ready,
+            current:
+                latestXanax,
+            observedConsumption,
+            consumptionPerDay:
+                Number(
+                    consumptionPerDay
+                        .toFixed(2)
+                ),
+            daysRemaining:
+                daysRemaining === null
+                    ? null
+                    : Number(
+                        daysRemaining
+                            .toFixed(2)
+                    ),
+            recommendedRestock,
+            targetStock,
+            snapshots:
+                safeSnapshots.length,
+            spanMs
+        }
+    };
+}
+
+
 function buildArmoryInventoryRows(snapshot) {
     const items =
         Array.isArray(
@@ -1678,7 +1841,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.3",
+        version: "0.9.4",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -2786,6 +2949,15 @@ app.get(
                 recentChanges: [],
                 alerts: [],
                 history: [],
+                forecast: {
+                    xanax: {
+                        ready: false,
+                        consumptionPerDay: 0,
+                        daysRemaining: null,
+                        recommendedRestock: 0,
+                        targetStock: 500
+                    }
+                },
                 inventory: []
             });
         }
@@ -2884,6 +3056,10 @@ app.get(
                     readyAlerts
                 ),
             history,
+            forecast:
+                buildArmoryForecast(
+                    snapshots
+                ),
             inventory:
                 buildArmoryInventoryRows(
                     latest
