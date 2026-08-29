@@ -16,6 +16,19 @@ const MICC_SECRET =
     process.env.MICC_SECRET ||
     "MICC-r8K42-xP91-2026";
 
+const FFSCOUTER_API_KEY =
+    String(
+        process.env.FFSCOUTER_API_KEY ||
+        ""
+    ).trim();
+
+const FFSCOUTER_FACTION_ID =
+    Number(
+        process.env.FFSCOUTER_FACTION_ID ||
+        0
+    );
+
+
 const DATA_FILE =
     path.join(__dirname, "micc-status.json");
 
@@ -2156,7 +2169,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.5",
+        version: "0.9.6",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -2974,6 +2987,260 @@ app.get(
     }
 );
 
+
+function ffscouterConfigured() {
+    return (
+        /^[A-Za-z0-9]{16}$/.test(
+            FFSCOUTER_API_KEY
+        )
+    );
+}
+
+function safeActivityDays(value) {
+    const days =
+        Number(value || 7);
+
+    return [7, 14, 30].includes(days)
+        ? days
+        : 7;
+}
+
+async function fetchFfscouterActivity(
+    endpoint,
+    params
+) {
+    const url =
+        new URL(
+            `https://ffscouter.com/api/v1/activity/${endpoint}`
+        );
+
+    url.searchParams.set(
+        "key",
+        FFSCOUTER_API_KEY
+    );
+
+    for (
+        const [key, value]
+        of Object.entries(params)
+    ) {
+        url.searchParams.set(
+            key,
+            String(value)
+        );
+    }
+
+    const response =
+        await fetch(
+            url,
+            {
+                method: "GET",
+                headers: {
+                    "Accept":
+                        "application/json"
+                }
+            }
+        );
+
+    let data = null;
+
+    try {
+        data =
+            await response.json();
+    } catch {
+        data = null;
+    }
+
+    if (!response.ok) {
+        const error =
+            new Error(
+                data?.error ||
+                data?.message ||
+                `FFScouter HTTP ${response.status}`
+            );
+
+        error.status =
+            response.status;
+
+        error.ffData =
+            data;
+
+        throw error;
+    }
+
+    return data;
+}
+
+app.get(
+    "/api/micc/ffscouter/player/:id",
+    auth,
+    async (req, res) => {
+        if (!ffscouterConfigured()) {
+            return res.json({
+                available: false,
+                reason:
+                    "No FFScouter Premium API key is configured on the MICC server."
+            });
+        }
+
+        const playerId =
+            Number(
+                req.params?.id
+            );
+
+        if (
+            !Number.isFinite(playerId) ||
+            playerId <= 0
+        ) {
+            return res
+                .status(400)
+                .json({
+                    available: false,
+                    reason:
+                        "Invalid player ID."
+                });
+        }
+
+        const days =
+            safeActivityDays(
+                req.query?.days
+            );
+
+        const end =
+            Math.floor(
+                Date.now() /
+                1000
+            );
+
+        const start =
+            end -
+            days *
+            24 *
+            60 *
+            60;
+
+        try {
+            // 7/14 days fit under FFScouter's 5000-bucket cap at 5 minutes.
+            // For 30 days, use 15-minute buckets to stay within the documented limit.
+            const bucket =
+                days === 30
+                    ? 900
+                    : 300;
+
+            const data =
+                await fetchFfscouterActivity(
+                    "player",
+                    {
+                        target:
+                            playerId,
+                        start,
+                        end,
+                        bucket
+                    }
+                );
+
+            return res.json({
+                available: true,
+                source:
+                    "ffscouter",
+                ...data
+            });
+
+        } catch (error) {
+            return res.json({
+                available: false,
+                reason:
+                    error?.message ||
+                    "FFScouter request failed.",
+                code:
+                    error?.ffData?.code ??
+                    null
+            });
+        }
+    }
+);
+
+app.get(
+    "/api/micc/ffscouter/faction",
+    auth,
+    async (req, res) => {
+        if (!ffscouterConfigured()) {
+            return res.json({
+                available: false,
+                reason:
+                    "No FFScouter Premium API key is configured on the MICC server."
+            });
+        }
+
+        if (
+            !Number.isFinite(
+                FFSCOUTER_FACTION_ID
+            ) ||
+            FFSCOUTER_FACTION_ID <= 0
+        ) {
+            return res.json({
+                available: false,
+                reason:
+                    "FFSCOUTER_FACTION_ID is not configured on the MICC server."
+            });
+        }
+
+        const days =
+            safeActivityDays(
+                req.query?.days
+            );
+
+        const end =
+            Math.floor(
+                Date.now() /
+                1000
+            );
+
+        const start =
+            end -
+            days *
+            24 *
+            60 *
+            60;
+
+        try {
+            const bucket =
+                days === 30
+                    ? 900
+                    : 300;
+
+            const data =
+                await fetchFfscouterActivity(
+                    "faction",
+                    {
+                        faction_id:
+                            FFSCOUTER_FACTION_ID,
+                        start,
+                        end,
+                        bucket
+                    }
+                );
+
+            return res.json({
+                available: true,
+                source:
+                    "ffscouter",
+                ...data
+            });
+
+        } catch (error) {
+            return res.json({
+                available: false,
+                reason:
+                    error?.message ||
+                    "FFScouter request failed.",
+                code:
+                    error?.ffData?.code ??
+                    null
+            });
+        }
+    }
+);
+
 app.get(
     "/api/micc/activity/member/:id",
     auth,
@@ -3616,6 +3883,8 @@ app.listen(PORT, () => {
     console.log("  GET  /api/micc/activity/summary");
     console.log("  GET  /api/micc/activity/member/:id");
     console.log("  GET  /api/micc/activity/faction");
+    console.log("  GET  /api/micc/ffscouter/player/:id");
+    console.log("  GET  /api/micc/ffscouter/faction");
     console.log("  POST /api/micc/armory/snapshot");
     console.log("  GET  /api/micc/armory/summary");
     console.log("");
