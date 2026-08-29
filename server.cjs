@@ -28,6 +28,12 @@ const FFSCOUTER_FACTION_ID =
         0
     );
 
+const TORN_FACTION_API_KEY =
+    String(
+        process.env.TORN_FACTION_API_KEY ||
+        ""
+    ).trim();
+
 
 const DATA_FILE =
     path.join(__dirname, "micc-status.json");
@@ -2506,7 +2512,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.9",
+        version: "0.9.10",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -3765,6 +3771,576 @@ app.get(
 // MICC ARMORY TRACKER
 // ============================================================
 
+
+function tornFactionApiConfigured() {
+    return (
+        TORN_FACTION_API_KEY.length >= 8
+    );
+}
+
+function safeArmoryUsageDays(value) {
+    const days =
+        Number(value || 30);
+
+    return [1, 7, 30].includes(days)
+        ? days
+        : 30;
+}
+
+function stripNewsText(value) {
+    return String(value || "")
+        .replace(/<[^>]*>/g, " ")
+        .replace(/&nbsp;/gi, " ")
+        .replace(/&amp;/gi, "&")
+        .replace(/&#39;/g, "'")
+        .replace(/&quot;/gi, '"')
+        .replace(/\s+/g, " ")
+        .trim();
+}
+
+function parseFactionArmoryUseNews(entry) {
+    const text =
+        stripNewsText(
+            entry?.text ??
+            entry?.news ??
+            ""
+        );
+
+    if (!text) {
+        return null;
+    }
+
+    // Current Torn faction armory usage wording:
+    // "Player used one of the faction's Xanax items"
+    // Also tolerate explicit quantities if Torn changes wording.
+    let match =
+        text.match(
+            /^(.+?)\s+used\s+one\s+of\s+the\s+faction['’]s\s+(.+?)\s+items?\.?$/i
+        );
+
+    let quantity = 1;
+    let actor = "";
+    let itemName = "";
+
+    if (match) {
+        actor =
+            String(match[1] || "").trim();
+        itemName =
+            String(match[2] || "").trim();
+    } else {
+        match =
+            text.match(
+                /^(.+?)\s+used\s+([\d,]+)\s+of\s+the\s+faction['’]s\s+(.+?)\s+items?\.?$/i
+            );
+
+        if (!match) {
+            return null;
+        }
+
+        actor =
+            String(match[1] || "").trim();
+
+        quantity =
+            Math.max(
+                1,
+                Number(
+                    String(match[2] || "1")
+                        .replace(/,/g, "")
+                ) || 1
+            );
+
+        itemName =
+            String(match[3] || "").trim();
+    }
+
+    if (
+        !itemName ||
+        /^points?$/i.test(itemName)
+    ) {
+        return null;
+    }
+
+    return {
+        id:
+            String(entry?.id || ""),
+        timestamp:
+            Number(entry?.timestamp || 0) || 0,
+        actor,
+        itemName,
+        quantity,
+        text
+    };
+}
+
+function latestArmoryCategoryMap() {
+    const snapshots =
+        Array.isArray(armoryDatabase?.snapshots)
+            ? armoryDatabase.snapshots
+            : [];
+
+    if (!snapshots.length) {
+        return new Map();
+    }
+
+    const latest =
+        snapshots
+            .slice()
+            .sort(
+                (a, b) =>
+                    Number(b?.ts || 0) -
+                    Number(a?.ts || 0)
+            )[0];
+
+    const map =
+        new Map();
+
+    for (
+        const item
+        of Array.isArray(latest?.items)
+            ? latest.items
+            : []
+    ) {
+        const name =
+            String(item?.name || "")
+                .trim()
+                .toLowerCase();
+
+        const category =
+            String(item?.category || "")
+                .trim()
+                .toLowerCase();
+
+        if (
+            name &&
+            ["drugs", "medical", "temporary"].includes(category)
+        ) {
+            map.set(name, category);
+        }
+    }
+
+    return map;
+}
+
+function inferConsumableCategory(
+    itemName,
+    categoryMap
+) {
+    const key =
+        String(itemName || "")
+            .trim()
+            .toLowerCase();
+
+    if (categoryMap.has(key)) {
+        return categoryMap.get(key);
+    }
+
+    // High-confidence fallback for the key drug the user specifically wants.
+    if (key === "xanax") {
+        return "drugs";
+    }
+
+    return "other";
+}
+
+async function fetchTornFactionNewsPage({
+    from,
+    to,
+    limit = 100,
+    sort = "asc"
+}) {
+    const url =
+        new URL(
+            "https://api.torn.com/v2/faction/news"
+        );
+
+    url.searchParams.set(
+        "cat",
+        "armoryAction"
+    );
+    url.searchParams.set(
+        "limit",
+        String(limit)
+    );
+    url.searchParams.set(
+        "sort",
+        sort
+    );
+    url.searchParams.set(
+        "from",
+        String(from)
+    );
+    url.searchParams.set(
+        "to",
+        String(to)
+    );
+    url.searchParams.set(
+        "stripTags",
+        "true"
+    );
+    url.searchParams.set(
+        "key",
+        TORN_FACTION_API_KEY
+    );
+
+    const response =
+        await fetch(
+            url,
+            {
+                method: "GET",
+                headers: {
+                    "Accept":
+                        "application/json"
+                }
+            }
+        );
+
+    let data = null;
+
+    try {
+        data =
+            await response.json();
+    } catch {
+        data = null;
+    }
+
+    if (!response.ok) {
+        const error =
+            new Error(
+                data?.error?.error ||
+                data?.error ||
+                data?.message ||
+                `Torn HTTP ${response.status}`
+            );
+
+        error.status =
+            response.status;
+        error.tornData =
+            data;
+
+        throw error;
+    }
+
+    if (data?.error) {
+        const error =
+            new Error(
+                data?.error?.error ||
+                data?.error?.message ||
+                "Torn API error"
+            );
+
+        error.tornData =
+            data;
+
+        throw error;
+    }
+
+    return data || {};
+}
+
+async function fetchFactionArmoryUseHistory(
+    days
+) {
+    const end =
+        Math.floor(
+            Date.now() / 1000
+        );
+
+    const start =
+        end -
+        days *
+        24 *
+        60 *
+        60;
+
+    const seen =
+        new Set();
+
+    const rows = [];
+
+    let cursor =
+        start;
+
+    // Safety cap: 30 days of a normal faction should be far below this.
+    for (
+        let page = 0;
+        page < 250;
+        page += 1
+    ) {
+        const data =
+            await fetchTornFactionNewsPage({
+                from: cursor,
+                to: end,
+                limit: 100,
+                sort: "asc"
+            });
+
+        const news =
+            Array.isArray(data?.news)
+                ? data.news
+                : (
+                    data?.news &&
+                    typeof data.news === "object"
+                        ? Object.values(data.news)
+                        : []
+                );
+
+        if (!news.length) {
+            break;
+        }
+
+        let maxTimestamp =
+            cursor;
+
+        let addedThisPage =
+            0;
+
+        for (const entry of news) {
+            const id =
+                String(
+                    entry?.id ||
+                    `${entry?.timestamp || 0}:${entry?.text || entry?.news || ""}`
+                );
+
+            maxTimestamp =
+                Math.max(
+                    maxTimestamp,
+                    Number(entry?.timestamp || 0) || 0
+                );
+
+            if (seen.has(id)) {
+                continue;
+            }
+
+            seen.add(id);
+            rows.push(entry);
+            addedThisPage += 1;
+        }
+
+        if (
+            news.length < 100 ||
+            maxTimestamp >= end
+        ) {
+            break;
+        }
+
+        // Torn pagination can repeat the boundary item.
+        // Advance one second and deduplicate IDs.
+        const nextCursor =
+            Math.max(
+                cursor + 1,
+                maxTimestamp + 1
+            );
+
+        if (nextCursor <= cursor) {
+            break;
+        }
+
+        cursor =
+            nextCursor;
+
+        if (!addedThisPage) {
+            break;
+        }
+    }
+
+    return {
+        start,
+        end,
+        news: rows
+    };
+}
+
+app.get(
+    "/api/micc/armory/news-usage",
+    auth,
+    async (req, res) => {
+        if (!tornFactionApiConfigured()) {
+            return res.json({
+                available: false,
+                source: "torn-faction-news",
+                reason:
+                    "TORN_FACTION_API_KEY is not configured on the MICC server."
+            });
+        }
+
+        const days =
+            safeArmoryUsageDays(
+                req.query?.days
+            );
+
+        try {
+            const history =
+                await fetchFactionArmoryUseHistory(
+                    days
+                );
+
+            const categoryMap =
+                latestArmoryCategoryMap();
+
+            const parsed =
+                history.news
+                    .map(
+                        parseFactionArmoryUseNews
+                    )
+                    .filter(Boolean);
+
+            const itemMap =
+                new Map();
+
+            const memberMap =
+                new Map();
+
+            let totalUsed = 0;
+
+            const categories = {
+                drugs: 0,
+                medical: 0,
+                temporary: 0,
+                other: 0
+            };
+
+            for (const event of parsed) {
+                const category =
+                    inferConsumableCategory(
+                        event.itemName,
+                        categoryMap
+                    );
+
+                const itemKey =
+                    event.itemName
+                        .trim()
+                        .toLowerCase();
+
+                const item =
+                    itemMap.get(itemKey) || {
+                        name:
+                            event.itemName,
+                        category,
+                        used: 0,
+                        events: 0
+                    };
+
+                item.used +=
+                    event.quantity;
+                item.events += 1;
+
+                if (
+                    item.category === "other" &&
+                    category !== "other"
+                ) {
+                    item.category =
+                        category;
+                }
+
+                itemMap.set(
+                    itemKey,
+                    item
+                );
+
+                const actor =
+                    event.actor || "Unknown";
+
+                const member =
+                    memberMap.get(actor) || {
+                        name: actor,
+                        used: 0,
+                        xanax: 0
+                    };
+
+                member.used +=
+                    event.quantity;
+
+                if (
+                    itemKey === "xanax"
+                ) {
+                    member.xanax +=
+                        event.quantity;
+                }
+
+                memberMap.set(
+                    actor,
+                    member
+                );
+
+                totalUsed +=
+                    event.quantity;
+
+                categories[
+                    Object.prototype.hasOwnProperty.call(
+                        categories,
+                        category
+                    )
+                        ? category
+                        : "other"
+                ] +=
+                    event.quantity;
+            }
+
+            const items =
+                [...itemMap.values()]
+                    .sort(
+                        (a, b) =>
+                            Number(b.used || 0) -
+                            Number(a.used || 0) ||
+                            a.name.localeCompare(b.name)
+                    );
+
+            const members =
+                [...memberMap.values()]
+                    .sort(
+                        (a, b) =>
+                            Number(b.xanax || 0) -
+                            Number(a.xanax || 0) ||
+                            Number(b.used || 0) -
+                            Number(a.used || 0) ||
+                            a.name.localeCompare(b.name)
+                    );
+
+            const xanax =
+                items.find(
+                    item =>
+                        item.name
+                            .trim()
+                            .toLowerCase() ===
+                        "xanax"
+                )?.used || 0;
+
+            return res.json({
+                available: true,
+                source:
+                    "torn-faction-news",
+                days,
+                from:
+                    history.start,
+                to:
+                    history.end,
+                rawNewsCount:
+                    history.news.length,
+                parsedUseEvents:
+                    parsed.length,
+                totalUsed,
+                xanax,
+                categories,
+                items,
+                members
+            });
+
+        } catch (error) {
+            return res.json({
+                available: false,
+                source:
+                    "torn-faction-news",
+                reason:
+                    error?.message ||
+                    "Torn faction armory news request failed.",
+                code:
+                    error?.tornData?.error?.code ??
+                    null
+            });
+        }
+    }
+);
+
 app.post(
     "/api/micc/armory/snapshot",
     auth,
@@ -4246,6 +4822,7 @@ app.listen(PORT, () => {
     console.log("  GET  /api/micc/ffscouter/faction");
     console.log("  POST /api/micc/armory/snapshot");
     console.log("  GET  /api/micc/armory/summary");
+    console.log("  GET  /api/micc/armory/news-usage");
     console.log("");
     console.log("MICC, Made by RobertHarvey.");
     console.log("");
