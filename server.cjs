@@ -25,10 +25,16 @@ const CALENDAR_FILE =
 const ACTIVITY_FILE =
     path.join(__dirname, "micc-activity.json");
 
+const ARMORY_FILE =
+    path.join(__dirname, "micc-armory.json");
+
 const ACTIVITY_BUCKET_MS =
     10 * 60 * 1000;
 
 const ACTIVITY_RETENTION_MS =
+    30 * 24 * 60 * 60 * 1000;
+
+const ARMORY_RETENTION_MS =
     30 * 24 * 60 * 60 * 1000;
 
 const CALENDAR_OWNER_ID = "3209900";
@@ -635,6 +641,896 @@ function buildActivityMemberSummary(
 }
 
 
+
+function loadArmoryDatabase() {
+    try {
+        if (!fs.existsSync(ARMORY_FILE)) {
+            return {
+                snapshots: []
+            };
+        }
+
+        const raw =
+            fs.readFileSync(
+                ARMORY_FILE,
+                "utf8"
+            );
+
+        if (!raw.trim()) {
+            return {
+                snapshots: []
+            };
+        }
+
+        const parsed =
+            JSON.parse(raw);
+
+        return {
+            snapshots:
+                Array.isArray(
+                    parsed?.snapshots
+                )
+                    ? parsed.snapshots
+                    : []
+        };
+    } catch (error) {
+        console.error(
+            "[MICC] Armory database load error:",
+            error
+        );
+
+        return {
+            snapshots: []
+        };
+    }
+}
+
+let armoryDatabase =
+    loadArmoryDatabase();
+
+function saveArmoryDatabase() {
+    try {
+        fs.writeFileSync(
+            ARMORY_FILE,
+            JSON.stringify(
+                armoryDatabase,
+                null,
+                2
+            )
+        );
+    } catch (error) {
+        console.error(
+            "[MICC] Armory database save error:",
+            error
+        );
+    }
+}
+
+function pruneArmoryDatabase(
+    now = Date.now()
+) {
+    const cutoff =
+        now -
+        ARMORY_RETENTION_MS;
+
+    const before =
+        Array.isArray(
+            armoryDatabase.snapshots
+        )
+            ? armoryDatabase.snapshots
+            : [];
+
+    const after =
+        before.filter(
+            snapshot =>
+                Number(
+                    snapshot?.ts || 0
+                ) >= cutoff
+        );
+
+    armoryDatabase.snapshots =
+        after;
+
+    if (
+        after.length !==
+        before.length
+    ) {
+        saveArmoryDatabase();
+    }
+}
+
+function normalizeArmoryIncomingItem(item) {
+    const id =
+        Number(item?.id || 0) || 0;
+
+    if (id <= 0) {
+        return null;
+    }
+
+    const amount =
+        Math.max(
+            0,
+            Math.floor(
+                Number(
+                    item?.amount || 0
+                ) || 0
+            )
+        );
+
+    const category =
+        String(
+            item?.category || ""
+        )
+            .trim()
+            .toLowerCase()
+            .slice(0, 30);
+
+    const uids =
+        Array.isArray(item?.uids)
+            ? item.uids
+                .map(uid =>
+                    String(
+                        uid || ""
+                    )
+                        .trim()
+                        .slice(0, 80)
+                )
+                .filter(Boolean)
+                .slice(0, 300)
+            : [];
+
+    const rwUids =
+        Array.isArray(item?.rwUids)
+            ? item.rwUids
+                .map(uid =>
+                    String(
+                        uid || ""
+                    )
+                        .trim()
+                        .slice(0, 80)
+                )
+                .filter(Boolean)
+                .slice(0, 300)
+            : [];
+
+    const loaned =
+        item?.loaned &&
+        typeof item.loaned ===
+            "object"
+            ? {
+                id:
+                    Number(
+                        item.loaned.id ||
+                        0
+                    ) || 0,
+                name:
+                    String(
+                        item.loaned.name ||
+                        ""
+                    )
+                        .trim()
+                        .slice(0, 64)
+            }
+            : null;
+
+    return {
+        id,
+        name:
+            String(
+                item?.name ||
+                `Item ${id}`
+            )
+                .trim()
+                .slice(0, 100),
+        type:
+            String(
+                item?.type || ""
+            )
+                .trim()
+                .slice(0, 60),
+        category,
+        amount,
+        uids,
+        rwUids,
+        loaned
+    };
+}
+
+function armorySnapshotKey(
+    sourceTimestamps,
+    items
+) {
+    const sourcePart =
+        Object.entries(
+            sourceTimestamps || {}
+        )
+            .sort(
+                ([a], [b]) =>
+                    a.localeCompare(b)
+            )
+            .map(
+                ([key, value]) =>
+                    `${key}:${Number(value || 0)}`
+            )
+            .join("|");
+
+    if (
+        sourcePart &&
+        !sourcePart
+            .split("|")
+            .every(
+                pair =>
+                    pair.endsWith(":0")
+            )
+    ) {
+        return sourcePart;
+    }
+
+    const itemPart =
+        items
+            .map(
+                item =>
+                    `${item.category}:${item.id}:${item.amount}:${item.rwUids.length}:${item.loaned?.id || 0}`
+            )
+            .sort()
+            .join("|");
+
+    return crypto
+        .createHash("sha1")
+        .update(itemPart)
+        .digest("hex");
+}
+
+function getArmoryMetrics(snapshot) {
+    const items =
+        Array.isArray(
+            snapshot?.items
+        )
+            ? snapshot.items
+            : [];
+
+    let xanax = 0;
+    let medical = 0;
+    let temporary = 0;
+    let armor = 0;
+    let armorLoaned = 0;
+    let rwWeapons = 0;
+    let rwLoaned = 0;
+
+    for (const item of items) {
+        const amount =
+            Math.max(
+                0,
+                Number(
+                    item?.amount || 0
+                ) || 0
+            );
+
+        const name =
+            String(
+                item?.name || ""
+            )
+                .trim()
+                .toLowerCase();
+
+        const category =
+            String(
+                item?.category || ""
+            )
+                .trim()
+                .toLowerCase();
+
+        if (
+            category === "drugs" &&
+            name === "xanax"
+        ) {
+            xanax += amount;
+        }
+
+        if (
+            category === "medical"
+        ) {
+            medical += amount;
+        }
+
+        if (
+            category === "temporary"
+        ) {
+            temporary += amount;
+        }
+
+        if (
+            category === "armor"
+        ) {
+            armor += amount;
+
+            if (item?.loaned) {
+                armorLoaned +=
+                    Math.min(
+                        amount,
+                        1
+                    );
+            }
+        }
+
+        if (
+            category === "weapons"
+        ) {
+            const rwCount =
+                Array.isArray(
+                    item?.rwUids
+                )
+                    ? item.rwUids.length
+                    : 0;
+
+            rwWeapons += rwCount;
+
+            if (
+                item?.loaned &&
+                rwCount > 0
+            ) {
+                rwLoaned +=
+                    Math.min(
+                        rwCount,
+                        1
+                    );
+            }
+        }
+    }
+
+    return {
+        xanax,
+        medical,
+        temporary,
+        rwWeapons,
+        rwAvailable:
+            Math.max(
+                0,
+                rwWeapons -
+                rwLoaned
+            ),
+        armor,
+        armorAvailable:
+            Math.max(
+                0,
+                armor -
+                armorLoaned
+            )
+    };
+}
+
+function getArmoryItemAmounts(snapshot) {
+    const map =
+        new Map();
+
+    const items =
+        Array.isArray(
+            snapshot?.items
+        )
+            ? snapshot.items
+            : [];
+
+    for (const item of items) {
+        const key =
+            `${item.category}:${item.id}`;
+
+        const existing =
+            map.get(key) || {
+                key,
+                id:
+                    Number(
+                        item.id || 0
+                    ),
+                name:
+                    String(
+                        item.name || ""
+                    ),
+                category:
+                    String(
+                        item.category || ""
+                    ),
+                amount: 0
+            };
+
+        existing.amount +=
+            Math.max(
+                0,
+                Number(
+                    item.amount || 0
+                ) || 0
+            );
+
+        map.set(
+            key,
+            existing
+        );
+    }
+
+    return map;
+}
+
+function getArmoryLowStock(snapshot) {
+    const items =
+        getArmoryItemAmounts(
+            snapshot
+        );
+
+    const lows = [];
+
+    for (
+        const entry
+        of items.values()
+    ) {
+        const name =
+            entry.name
+                .trim()
+                .toLowerCase();
+
+        const category =
+            entry.category
+                .trim()
+                .toLowerCase();
+
+        let threshold = null;
+
+        if (
+            category === "drugs" &&
+            name === "xanax"
+        ) {
+            threshold = 100;
+        } else if (
+            category === "medical" &&
+            name === "first aid kit"
+        ) {
+            threshold = 200;
+        } else if (
+            category === "medical"
+        ) {
+            threshold = 50;
+        } else if (
+            category === "temporary"
+        ) {
+            threshold = 25;
+        }
+
+        if (
+            threshold !== null &&
+            entry.amount < threshold
+        ) {
+            lows.push({
+                key: entry.key,
+                label: entry.name,
+                current:
+                    entry.amount,
+                threshold,
+                ratio:
+                    threshold > 0
+                        ? entry.amount /
+                            threshold
+                        : 1
+            });
+        }
+    }
+
+    const metrics =
+        getArmoryMetrics(
+            snapshot
+        );
+
+    if (
+        metrics.rwAvailable < 3
+    ) {
+        lows.push({
+            key:
+                "group:rwAvailable",
+            label:
+                "Available RW weapons",
+            current:
+                metrics.rwAvailable,
+            threshold: 3,
+            ratio:
+                metrics.rwAvailable /
+                3
+        });
+    }
+
+    if (
+        metrics.armorAvailable < 10
+    ) {
+        lows.push({
+            key:
+                "group:armorAvailable",
+            label:
+                "Available armor",
+            current:
+                metrics.armorAvailable,
+            threshold: 10,
+            ratio:
+                metrics.armorAvailable /
+                10
+        });
+    }
+
+    return lows.sort(
+        (a, b) =>
+            Number(a.ratio || 0) -
+            Number(b.ratio || 0)
+    );
+}
+
+function buildArmoryRecentChanges(
+    latest,
+    previous
+) {
+    if (
+        !latest ||
+        !previous
+    ) {
+        return [];
+    }
+
+    const latestMap =
+        getArmoryItemAmounts(
+            latest
+        );
+
+    const previousMap =
+        getArmoryItemAmounts(
+            previous
+        );
+
+    const keys =
+        new Set([
+            ...latestMap.keys(),
+            ...previousMap.keys()
+        ]);
+
+    const changes = [];
+
+    for (const key of keys) {
+        const current =
+            latestMap.get(key);
+        const prior =
+            previousMap.get(key);
+
+        const currentAmount =
+            Number(
+                current?.amount || 0
+            );
+
+        const priorAmount =
+            Number(
+                prior?.amount || 0
+            );
+
+        const delta =
+            currentAmount -
+            priorAmount;
+
+        if (!delta) {
+            continue;
+        }
+
+        changes.push({
+            key,
+            label:
+                current?.name ||
+                prior?.name ||
+                key,
+            category:
+                current?.category ||
+                prior?.category ||
+                "",
+            current:
+                currentAmount,
+            previous:
+                priorAmount,
+            delta
+        });
+    }
+
+    const latestMetrics =
+        getArmoryMetrics(
+            latest
+        );
+
+    const previousMetrics =
+        getArmoryMetrics(
+            previous
+        );
+
+    for (
+        const [key, label]
+        of [
+            ["rwWeapons", "RW weapons"],
+            ["armor", "Armor"]
+        ]
+    ) {
+        const delta =
+            Number(
+                latestMetrics[key] || 0
+            ) -
+            Number(
+                previousMetrics[key] ||
+                0
+            );
+
+        if (delta) {
+            changes.push({
+                key:
+                    `group:${key}`,
+                label,
+                category: "group",
+                current:
+                    latestMetrics[key],
+                previous:
+                    previousMetrics[key],
+                delta
+            });
+        }
+    }
+
+    return changes.sort(
+        (a, b) =>
+            Math.abs(
+                Number(b.delta || 0)
+            ) -
+            Math.abs(
+                Number(a.delta || 0)
+            )
+    );
+}
+
+function median(values) {
+    const nums =
+        values
+            .map(Number)
+            .filter(Number.isFinite)
+            .sort(
+                (a, b) =>
+                    a - b
+            );
+
+    if (!nums.length) {
+        return 0;
+    }
+
+    const middle =
+        Math.floor(
+            nums.length / 2
+        );
+
+    if (
+        nums.length % 2
+    ) {
+        return nums[middle];
+    }
+
+    return (
+        nums[middle - 1] +
+        nums[middle]
+    ) / 2;
+}
+
+function buildArmoryAlerts(
+    snapshots,
+    readyAlerts
+) {
+    const alerts = [];
+
+    const latest =
+        snapshots[
+            snapshots.length - 1
+        ];
+
+    if (!latest) {
+        return alerts;
+    }
+
+    for (
+        const low
+        of getArmoryLowStock(
+            latest
+        )
+    ) {
+        alerts.push({
+            level:
+                Number(
+                    low.ratio || 0
+                ) <= .5
+                    ? "critical"
+                    : "warning",
+            key:
+                `low:${low.key}`,
+            message:
+                `${low.label} is low: ${low.current} / ${low.threshold}`
+        });
+    }
+
+    if (
+        !readyAlerts ||
+        snapshots.length < 3
+    ) {
+        return alerts;
+    }
+
+    const allKeys =
+        new Set();
+
+    for (const snapshot of snapshots) {
+        for (
+            const key
+            of getArmoryItemAmounts(
+                snapshot
+            ).keys()
+        ) {
+            allKeys.add(key);
+        }
+    }
+
+    for (const key of allKeys) {
+        const values =
+            snapshots.map(
+                snapshot => {
+                    const entry =
+                        getArmoryItemAmounts(
+                            snapshot
+                        ).get(key);
+
+                    return {
+                        ts:
+                            Number(
+                                snapshot.ts ||
+                                0
+                            ),
+                        amount:
+                            Number(
+                                entry?.amount ||
+                                0
+                            ),
+                        name:
+                            entry?.name ||
+                            key
+                    };
+                }
+            );
+
+        const latestPair =
+            values.slice(-2);
+
+        if (
+            latestPair.length < 2
+        ) {
+            continue;
+        }
+
+        const latestDrop =
+            latestPair[0].amount -
+            latestPair[1].amount;
+
+        if (
+            latestDrop <= 0
+        ) {
+            continue;
+        }
+
+        const historicalDrops = [];
+
+        for (
+            let index = 1;
+            index <
+            values.length - 1;
+            index += 1
+        ) {
+            const drop =
+                values[index - 1]
+                    .amount -
+                values[index]
+                    .amount;
+
+            if (drop > 0) {
+                historicalDrops.push(
+                    drop
+                );
+            }
+        }
+
+        const typical =
+            median(
+                historicalDrops
+            );
+
+        const previousAmount =
+            Math.max(
+                1,
+                latestPair[0].amount
+            );
+
+        const percentage =
+            latestDrop /
+            previousAmount;
+
+        const unusualThreshold =
+            Math.max(
+                5,
+                typical > 0
+                    ? typical * 2.5
+                    : 5
+            );
+
+        if (
+            latestDrop >=
+                unusualThreshold &&
+            percentage >= .10
+        ) {
+            alerts.push({
+                level:
+                    percentage >= .30
+                        ? "critical"
+                        : "warning",
+                key:
+                    `drop:${key}`,
+                message:
+                    `${latestPair[1].name} dropped by ${latestDrop} (${Math.round(percentage * 100)}%) in the latest armory snapshot`
+            });
+        }
+    }
+
+    return alerts;
+}
+
+function buildArmoryInventoryRows(snapshot) {
+    const items =
+        Array.isArray(
+            snapshot?.items
+        )
+            ? snapshot.items
+            : [];
+
+    return items
+        .map(
+            item => ({
+                id:
+                    Number(
+                        item.id || 0
+                    ),
+                name:
+                    String(
+                        item.name || ""
+                    ),
+                category:
+                    String(
+                        item.category || ""
+                    ),
+                amount:
+                    Number(
+                        item.amount || 0
+                    ),
+                rwCount:
+                    Array.isArray(
+                        item.rwUids
+                    )
+                        ? item.rwUids.length
+                        : 0,
+                loanedTo:
+                    item?.loaned?.name ||
+                    ""
+            })
+        )
+        .sort(
+            (a, b) =>
+                a.category
+                    .localeCompare(
+                        b.category
+                    ) ||
+                a.name
+                    .localeCompare(
+                        b.name
+                    )
+        );
+}
+
+
 function makeId(prefix) {
     return (
         `${prefix}_` +
@@ -782,7 +1678,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.2",
+        version: "0.9.3",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -1641,6 +2537,401 @@ app.get(
 );
 
 
+
+// ============================================================
+// MICC ARMORY TRACKER
+// ============================================================
+
+app.post(
+    "/api/micc/armory/snapshot",
+    auth,
+    (req, res) => {
+        const incomingItems =
+            Array.isArray(
+                req.body?.items
+            )
+                ? req.body.items
+                : [];
+
+        if (!incomingItems.length) {
+            return res.status(400).json({
+                success: false,
+                error:
+                    "No armory items supplied"
+            });
+        }
+
+        if (
+            incomingItems.length >
+            5000
+        ) {
+            return res.status(400).json({
+                success: false,
+                error:
+                    "Too many armory rows in one snapshot"
+            });
+        }
+
+        const items =
+            incomingItems
+                .map(
+                    normalizeArmoryIncomingItem
+                )
+                .filter(Boolean);
+
+        if (!items.length) {
+            return res.status(400).json({
+                success: false,
+                error:
+                    "No valid armory items supplied"
+            });
+        }
+
+        const now =
+            Date.now();
+
+        const requestedObservedAt =
+            Number(
+                req.body?.observedAt ||
+                now
+            );
+
+        const observedAt =
+            Number.isFinite(
+                requestedObservedAt
+            )
+                ? Math.min(
+                    now + 60000,
+                    Math.max(
+                        now -
+                        90 * 60 * 1000,
+                        requestedObservedAt
+                    )
+                )
+                : now;
+
+        const sourceTimestamps =
+            req.body?.sourceTimestamps &&
+            typeof req.body
+                .sourceTimestamps ===
+                "object"
+                ? Object.fromEntries(
+                    Object.entries(
+                        req.body
+                            .sourceTimestamps
+                    )
+                        .slice(0, 20)
+                        .map(
+                            ([key, value]) => [
+                                String(key)
+                                    .slice(0, 30),
+                                Number(
+                                    value || 0
+                                ) || 0
+                            ]
+                        )
+                )
+                : {};
+
+        const key =
+            armorySnapshotKey(
+                sourceTimestamps,
+                items
+            );
+
+        const snapshot = {
+            ts:
+                observedAt,
+            key,
+            sourceTimestamps,
+            items
+        };
+
+        if (
+            !Array.isArray(
+                armoryDatabase.snapshots
+            )
+        ) {
+            armoryDatabase
+                .snapshots = [];
+        }
+
+        const last =
+            armoryDatabase
+                .snapshots[
+                    armoryDatabase
+                        .snapshots
+                        .length - 1
+                ];
+
+        if (
+            last &&
+            String(last.key || "") ===
+                key
+        ) {
+            // Same Torn cache snapshot: refresh it rather than
+            // creating fake extra history points.
+            armoryDatabase.snapshots[
+                armoryDatabase
+                    .snapshots
+                    .length - 1
+            ] = {
+                ...snapshot,
+                ts:
+                    Number(
+                        last.ts ||
+                        observedAt
+                    )
+            };
+        } else {
+            armoryDatabase
+                .snapshots
+                .push(snapshot);
+        }
+
+        pruneArmoryDatabase(
+            now
+        );
+
+        saveArmoryDatabase();
+
+        res.json({
+            success: true,
+            snapshots:
+                armoryDatabase
+                    .snapshots.length,
+            distinct:
+                !last ||
+                String(
+                    last.key || ""
+                ) !== key,
+            metrics:
+                getArmoryMetrics(
+                    snapshot
+                )
+        });
+    }
+);
+
+app.get(
+    "/api/micc/armory/summary",
+    auth,
+    (req, res) => {
+        const requestedDays =
+            Number(
+                req.query?.days ||
+                7
+            );
+
+        const days =
+            [1, 7, 30].includes(
+                requestedDays
+            )
+                ? requestedDays
+                : 7;
+
+        const now =
+            Date.now();
+
+        pruneArmoryDatabase(
+            now
+        );
+
+        const since =
+            now -
+            days *
+            24 *
+            60 *
+            60 *
+            1000;
+
+        const snapshots =
+            (Array.isArray(
+                armoryDatabase
+                    .snapshots
+            )
+                ? armoryDatabase
+                    .snapshots
+                : []
+            )
+                .filter(
+                    snapshot =>
+                        Number(
+                            snapshot?.ts ||
+                            0
+                        ) >= since
+                )
+                .sort(
+                    (a, b) =>
+                        Number(
+                            a.ts || 0
+                        ) -
+                        Number(
+                            b.ts || 0
+                        )
+                );
+
+        if (!snapshots.length) {
+            return res.json({
+                success: true,
+                days,
+                overview: {},
+                collection: {
+                    snapshotCount: 0,
+                    spanMs: 0,
+                    readyHistory: false,
+                    readyAlerts: false
+                },
+                lowStock: [],
+                recentChanges: [],
+                alerts: [],
+                history: [],
+                inventory: []
+            });
+        }
+
+        const latest =
+            snapshots[
+                snapshots.length - 1
+            ];
+
+        const previous =
+            snapshots.length >= 2
+                ? snapshots[
+                    snapshots.length - 2
+                ]
+                : null;
+
+        const spanMs =
+            Math.max(
+                0,
+                Number(
+                    latest.ts || 0
+                ) -
+                Number(
+                    snapshots[0]
+                        ?.ts || 0
+                )
+            );
+
+        const readyHistory =
+            snapshots.length >= 3 &&
+            spanMs >=
+                2 *
+                60 *
+                60 *
+                1000;
+
+        const readyAlerts =
+            snapshots.length >= 6 &&
+            spanMs >=
+                5 *
+                60 *
+                60 *
+                1000;
+
+        const history =
+            snapshots.map(
+                snapshot => ({
+                    ts:
+                        Number(
+                            snapshot.ts ||
+                            0
+                        ),
+                    metrics:
+                        getArmoryMetrics(
+                            snapshot
+                        )
+                })
+            );
+
+        res.json({
+            success: true,
+            days,
+            observedAt: now,
+            overview:
+                getArmoryMetrics(
+                    latest
+                ),
+            collection: {
+                snapshotCount:
+                    snapshots.length,
+                spanMs,
+                readyHistory,
+                readyAlerts,
+                firstSnapshot:
+                    Number(
+                        snapshots[0]
+                            ?.ts || 0
+                    ),
+                lastSnapshot:
+                    Number(
+                        latest?.ts || 0
+                    )
+            },
+            lowStock:
+                getArmoryLowStock(
+                    latest
+                ),
+            recentChanges:
+                buildArmoryRecentChanges(
+                    latest,
+                    previous
+                ),
+            alerts:
+                buildArmoryAlerts(
+                    snapshots,
+                    readyAlerts
+                ),
+            history,
+            inventory:
+                buildArmoryInventoryRows(
+                    latest
+                )
+        });
+    }
+);
+
+app.get(
+    "/api/micc/armory/debug",
+    auth,
+    (req, res) => {
+        pruneArmoryDatabase();
+
+        const snapshots =
+            Array.isArray(
+                armoryDatabase
+                    .snapshots
+            )
+                ? armoryDatabase
+                    .snapshots
+                : [];
+
+        res.json({
+            success: true,
+            snapshots:
+                snapshots.length,
+            retentionDays:
+                ARMORY_RETENTION_MS /
+                (
+                    24 *
+                    60 *
+                    60 *
+                    1000
+                ),
+            latestMetrics:
+                snapshots.length
+                    ? getArmoryMetrics(
+                        snapshots[
+                            snapshots.length - 1
+                        ]
+                    )
+                    : {}
+        });
+    }
+);
+
+
 // ============================================================
 // JSON 404
 // ============================================================
@@ -1691,6 +2982,8 @@ app.listen(PORT, () => {
     console.log("  POST /api/micc/calendar/note");
     console.log("  POST /api/micc/activity/observe");
     console.log("  GET  /api/micc/activity/summary");
+    console.log("  POST /api/micc/armory/snapshot");
+    console.log("  GET  /api/micc/armory/summary");
     console.log("");
     console.log("MICC, Made by RobertHarvey.");
     console.log("");
