@@ -649,7 +649,11 @@ function buildActivityMemberSummary(
                     last24Active /
                     last24Samples
                 ) * 100
-                : 0
+                : 0,
+        currentStatus:
+            normalizeActivityStatus(
+                latest?.status
+            )
     };
 }
 
@@ -951,6 +955,47 @@ function buildFactionActivityDetail(
         summary: {
             membersTracked:
                 members.length,
+            current: (() => {
+                let online = 0;
+                let idle = 0;
+                let offline = 0;
+
+                for (
+                    const member
+                    of members
+                ) {
+                    const observations =
+                        Array.isArray(
+                            member?.observations
+                        )
+                            ? member.observations
+                            : [];
+
+                    const latest =
+                        observations[
+                            observations.length - 1
+                        ];
+
+                    const status =
+                        normalizeActivityStatus(
+                            latest?.status
+                        );
+
+                    if (status === "online") {
+                        online += 1;
+                    } else if (status === "idle") {
+                        idle += 1;
+                    } else {
+                        offline += 1;
+                    }
+                }
+
+                return {
+                    online,
+                    idle,
+                    offline
+                };
+            })(),
             samples:
                 totalSamples,
             activityPct:
@@ -2169,7 +2214,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.6",
+        version: "0.9.7",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
