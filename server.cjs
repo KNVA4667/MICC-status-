@@ -642,6 +642,321 @@ function buildActivityMemberSummary(
 
 
 
+function buildActivityMemberDays(
+    member,
+    since,
+    now
+) {
+    const observations =
+        (Array.isArray(member?.observations)
+            ? member.observations
+            : []
+        )
+            .filter(
+                observation =>
+                    Number(observation?.ts || 0) >= since &&
+                    Number(observation?.ts || 0) <= now
+            )
+            .sort(
+                (a, b) =>
+                    Number(a?.ts || 0) -
+                    Number(b?.ts || 0)
+            );
+
+    const dayMap =
+        new Map();
+
+    const dayStart =
+        new Date(since);
+
+    dayStart.setUTCHours(
+        0,
+        0,
+        0,
+        0
+    );
+
+    const endDay =
+        new Date(now);
+
+    endDay.setUTCHours(
+        0,
+        0,
+        0,
+        0
+    );
+
+    for (
+        let cursor = dayStart.getTime();
+        cursor <= endDay.getTime();
+        cursor += 24 * 60 * 60 * 1000
+    ) {
+        const date =
+            new Date(cursor)
+                .toISOString()
+                .slice(0, 10);
+
+        dayMap.set(
+            date,
+            new Array(144).fill(null)
+        );
+    }
+
+    for (
+        const observation
+        of observations
+    ) {
+        const ts =
+            Number(
+                observation?.ts || 0
+            );
+
+        if (!ts) {
+            continue;
+        }
+
+        const date =
+            new Date(ts);
+
+        const dateKey =
+            date.toISOString()
+                .slice(0, 10);
+
+        const bucket =
+            date.getUTCHours() * 6 +
+            Math.floor(
+                date.getUTCMinutes() / 10
+            );
+
+        const buckets =
+            dayMap.get(dateKey);
+
+        if (
+            buckets &&
+            bucket >= 0 &&
+            bucket < 144
+        ) {
+            buckets[bucket] =
+                normalizeActivityStatus(
+                    observation?.status
+                );
+        }
+    }
+
+    return Array.from(
+        dayMap.entries()
+    )
+        .map(
+            ([date, buckets]) => ({
+                date,
+                buckets
+            })
+        );
+}
+
+function buildFactionActivityDetail(
+    since,
+    now
+) {
+    const members =
+        Object.values(
+            activityDatabase.members
+        );
+
+    const dayMap =
+        new Map();
+
+    const hourTotals =
+        new Array(24).fill(0);
+
+    const hourActive =
+        new Array(24).fill(0);
+
+    const activeDates =
+        new Set();
+
+    let totalSamples = 0;
+    let activeSamples = 0;
+
+    for (
+        const member
+        of members
+    ) {
+        const observations =
+            (Array.isArray(member?.observations)
+                ? member.observations
+                : []
+            ).filter(
+                observation =>
+                    Number(observation?.ts || 0) >= since &&
+                    Number(observation?.ts || 0) <= now
+            );
+
+        for (
+            const observation
+            of observations
+        ) {
+            const ts =
+                Number(
+                    observation?.ts || 0
+                );
+
+            if (!ts) {
+                continue;
+            }
+
+            const date =
+                new Date(ts);
+
+            const dateKey =
+                date.toISOString()
+                    .slice(0, 10);
+
+            const hour =
+                date.getUTCHours();
+
+            const status =
+                normalizeActivityStatus(
+                    observation?.status
+                );
+
+            const active =
+                status === "online" ||
+                status === "idle";
+
+            const key =
+                `${dateKey}:${hour}`;
+
+            if (!dayMap.has(key)) {
+                dayMap.set(
+                    key,
+                    {
+                        date: dateKey,
+                        hour,
+                        samples: 0,
+                        active: 0
+                    }
+                );
+            }
+
+            const entry =
+                dayMap.get(key);
+
+            entry.samples += 1;
+            totalSamples += 1;
+            hourTotals[hour] += 1;
+
+            if (active) {
+                entry.active += 1;
+                activeSamples += 1;
+                hourActive[hour] += 1;
+                activeDates.add(dateKey);
+            }
+        }
+    }
+
+    let peakHour = null;
+    let peakPct = -1;
+
+    for (
+        let hour = 0;
+        hour < 24;
+        hour += 1
+    ) {
+        if (!hourTotals[hour]) {
+            continue;
+        }
+
+        const pct =
+            (
+                hourActive[hour] /
+                hourTotals[hour]
+            ) * 100;
+
+        if (pct > peakPct) {
+            peakPct = pct;
+            peakHour = hour;
+        }
+    }
+
+    const dateKeys =
+        new Set();
+
+    for (
+        const entry
+        of dayMap.values()
+    ) {
+        dateKeys.add(
+            entry.date
+        );
+    }
+
+    const days =
+        Array.from(dateKeys)
+            .sort()
+            .map(
+                date => ({
+                    date,
+                    hours:
+                        Array.from(
+                            { length: 24 },
+                            (_, hour) => {
+                                const entry =
+                                    dayMap.get(
+                                        `${date}:${hour}`
+                                    );
+
+                                const samples =
+                                    Number(
+                                        entry?.samples ||
+                                        0
+                                    );
+
+                                const active =
+                                    Number(
+                                        entry?.active ||
+                                        0
+                                    );
+
+                                return {
+                                    hour,
+                                    samples,
+                                    activityPct:
+                                        samples > 0
+                                            ? (
+                                                active /
+                                                samples
+                                            ) * 100
+                                            : 0
+                                };
+                            }
+                        )
+                })
+            );
+
+    return {
+        summary: {
+            membersTracked:
+                members.length,
+            samples:
+                totalSamples,
+            activityPct:
+                totalSamples > 0
+                    ? (
+                        activeSamples /
+                        totalSamples
+                    ) * 100
+                    : 0,
+            activeDays:
+                activeDates.size,
+            peakHour
+        },
+        days
+    };
+}
+
+
+
 function loadArmoryDatabase() {
     try {
         if (!fs.existsSync(ARMORY_FILE)) {
@@ -1841,7 +2156,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.4",
+        version: "0.9.5",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -2660,6 +2975,147 @@ app.get(
 );
 
 app.get(
+    "/api/micc/activity/member/:id",
+    auth,
+    (req, res) => {
+        const requestedDays =
+            Number(
+                req.query?.days ||
+                7
+            );
+
+        const days =
+            [7, 14, 30].includes(
+                requestedDays
+            )
+                ? requestedDays
+                : 7;
+
+        const playerId =
+            Number(
+                req.params?.id
+            );
+
+        if (
+            !Number.isFinite(playerId) ||
+            playerId <= 0
+        ) {
+            return res
+                .status(400)
+                .json({
+                    error:
+                        "Invalid player ID"
+                });
+        }
+
+        const now =
+            Date.now();
+
+        const since =
+            now -
+            days *
+            24 *
+            60 *
+            60 *
+            1000;
+
+        pruneActivityDatabase(
+            now
+        );
+
+        const member =
+            activityDatabase
+                .members[
+                    String(playerId)
+                ];
+
+        if (!member) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        "No activity history found for this member"
+                });
+        }
+
+        const summary =
+            buildActivityMemberSummary(
+                member,
+                since,
+                now
+            );
+
+        res.json({
+            success: true,
+            days,
+            observedAt: now,
+            member: {
+                playerId,
+                name:
+                    String(
+                        member.name ||
+                        ""
+                    ),
+                summary,
+                days:
+                    buildActivityMemberDays(
+                        member,
+                        since,
+                        now
+                    )
+            }
+        });
+    }
+);
+
+app.get(
+    "/api/micc/activity/faction",
+    auth,
+    (req, res) => {
+        const requestedDays =
+            Number(
+                req.query?.days ||
+                7
+            );
+
+        const days =
+            [7, 14, 30].includes(
+                requestedDays
+            )
+                ? requestedDays
+                : 7;
+
+        const now =
+            Date.now();
+
+        const since =
+            now -
+            days *
+            24 *
+            60 *
+            60 *
+            1000;
+
+        pruneActivityDatabase(
+            now
+        );
+
+        const detail =
+            buildFactionActivityDetail(
+                since,
+                now
+            );
+
+        res.json({
+            success: true,
+            days,
+            observedAt: now,
+            ...detail
+        });
+    }
+);
+
+app.get(
     "/api/micc/activity/debug",
     auth,
     (req, res) => {
@@ -3158,6 +3614,8 @@ app.listen(PORT, () => {
     console.log("  POST /api/micc/calendar/note");
     console.log("  POST /api/micc/activity/observe");
     console.log("  GET  /api/micc/activity/summary");
+    console.log("  GET  /api/micc/activity/member/:id");
+    console.log("  GET  /api/micc/activity/faction");
     console.log("  POST /api/micc/armory/snapshot");
     console.log("  GET  /api/micc/armory/summary");
     console.log("");
