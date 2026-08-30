@@ -2524,7 +2524,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.12",
+        version: "0.9.13",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -5199,6 +5199,165 @@ app.use((error, req, res, next) => {
 // ============================================================
 // START SERVER
 // ============================================================
+
+
+// ============================================================
+// FFSCOUTER PLAYER FLIGHTS (PREMIUM)
+// Keeps the FFScouter API key server-side.
+// ============================================================
+
+const MICC_FFSCOUTER_FLIGHT_CACHE_MS = 10 * 1000;
+const miccFfscouterFlightCache = new Map();
+
+function miccGetFfscouterKey() {
+    return String(
+        process.env.FFSCOUTER_API_KEY || ""
+    ).trim();
+}
+
+app.get(
+    "/api/micc/ffscouter/flights/:playerId",
+    async (req, res) => {
+        const playerId =
+            String(
+                req.params.playerId || ""
+            ).trim();
+
+        if (!/^\d+$/.test(playerId)) {
+            return res.status(400).json({
+                ok: false,
+                error: "Invalid player ID."
+            });
+        }
+
+        const ffKey =
+            miccGetFfscouterKey();
+
+        if (!ffKey) {
+            return res.status(503).json({
+                ok: false,
+                error:
+                    "FFScouter API key is not configured."
+            });
+        }
+
+        const cached =
+            miccFfscouterFlightCache.get(
+                playerId
+            );
+
+        if (
+            cached &&
+            Date.now() -
+                cached.timestamp <
+                MICC_FFSCOUTER_FLIGHT_CACHE_MS
+        ) {
+            return res.json(
+                cached.payload
+            );
+        }
+
+        try {
+            const url =
+                new URL(
+                    "https://ffscouter.com/api/v1/player-flights"
+                );
+
+            url.searchParams.set(
+                "key",
+                ffKey
+            );
+
+            url.searchParams.set(
+                "target",
+                playerId
+            );
+
+            const response =
+                await fetch(
+                    url,
+                    {
+                        headers: {
+                            Accept:
+                                "application/json"
+                        }
+                    }
+                );
+
+            const data =
+                await response.json();
+
+            if (!response.ok) {
+                return res
+                    .status(response.status)
+                    .json({
+                        ok: false,
+                        error:
+                            data?.error ||
+                            "FFScouter flight lookup failed."
+                    });
+            }
+
+            const current =
+                data?.current || null;
+
+            const payload = {
+                ok: true,
+                player_id:
+                    Number(playerId),
+                current:
+                    current
+                        ? {
+                            takeoff_time:
+                                current.takeoff_time ??
+                                null,
+                            status_description:
+                                current.status_description ??
+                                null,
+                            earliest_arrival_time:
+                                current.earliest_arrival_time ??
+                                null,
+                            latest_arrival_time:
+                                current.latest_arrival_time ??
+                                null,
+                            travel_method:
+                                current.travel_method ??
+                                "Unknown",
+                            book_likely_being_used:
+                                current.book_likely_being_used ??
+                                null
+                        }
+                        : null
+            };
+
+            miccFfscouterFlightCache.set(
+                playerId,
+                {
+                    timestamp:
+                        Date.now(),
+                    payload
+                }
+            );
+
+            return res.json(
+                payload
+            );
+
+        } catch (error) {
+            console.error(
+                "[MICC] FFScouter flight lookup failed:",
+                error
+            );
+
+            return res.status(502).json({
+                ok: false,
+                error:
+                    "Unable to reach FFScouter."
+            });
+        }
+    }
+);
+
 
 app.listen(PORT, () => {
     console.log("");
