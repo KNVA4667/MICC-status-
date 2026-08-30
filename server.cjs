@@ -47,6 +47,18 @@ const ACTIVITY_FILE =
 const ARMORY_FILE =
     path.join(__dirname, "micc-armory.json");
 
+const ARMORY_NEWS_CACHE_FILE =
+    path.join(__dirname, "micc-armory-news-cache.json");
+
+const ARMORY_NEWS_SYNC_MS =
+    5 * 60 * 1000;
+
+const ARMORY_NEWS_RETENTION_SECONDS =
+    31 * 24 * 60 * 60;
+
+const ARMORY_NEWS_BOOTSTRAP_RETRY_MS =
+    15 * 60 * 1000;
+
 const ACTIVITY_BUCKET_MS =
     10 * 60 * 1000;
 
@@ -2512,7 +2524,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.11",
+        version: "0.9.12",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -3778,6 +3790,119 @@ function tornFactionApiConfigured() {
     );
 }
 
+
+function loadArmoryNewsCache() {
+    try {
+        if (!fs.existsSync(ARMORY_NEWS_CACHE_FILE)) {
+            return {
+                initialized: false,
+                events: [],
+                lastSuccessfulSync: 0,
+                lastAttempt: 0,
+                lastError: ""
+            };
+        }
+
+        const parsed =
+            JSON.parse(
+                fs.readFileSync(
+                    ARMORY_NEWS_CACHE_FILE,
+                    "utf8"
+                )
+            );
+
+        return {
+            initialized:
+                Boolean(parsed?.initialized),
+            events:
+                Array.isArray(parsed?.events)
+                    ? parsed.events
+                    : [],
+            lastSuccessfulSync:
+                Number(parsed?.lastSuccessfulSync || 0),
+            lastAttempt:
+                Number(parsed?.lastAttempt || 0),
+            lastError:
+                String(parsed?.lastError || "")
+        };
+    } catch (error) {
+        console.error("[MICC] Armory news cache load error:", error);
+        return {
+            initialized: false,
+            events: [],
+            lastSuccessfulSync: 0,
+            lastAttempt: 0,
+            lastError: ""
+        };
+    }
+}
+
+let armoryNewsCache =
+    loadArmoryNewsCache();
+
+let armoryNewsSyncBusy = false;
+
+function saveArmoryNewsCache() {
+    try {
+        fs.writeFileSync(
+            ARMORY_NEWS_CACHE_FILE,
+            JSON.stringify(
+                armoryNewsCache,
+                null,
+                2
+            )
+        );
+    } catch (error) {
+        console.error("[MICC] Armory news cache save error:", error);
+    }
+}
+
+function trimArmoryNewsCache() {
+    const cutoff =
+        Math.floor(Date.now() / 1000) -
+        ARMORY_NEWS_RETENTION_SECONDS;
+
+    armoryNewsCache.events =
+        armoryNewsCache.events
+            .filter(
+                event =>
+                    Number(event?.timestamp || 0) >= cutoff
+            )
+            .sort(
+                (a, b) =>
+                    Number(a?.timestamp || 0) -
+                    Number(b?.timestamp || 0)
+            );
+}
+
+function mergeArmoryNewsEvents(events) {
+    const map = new Map();
+
+    for (const event of [
+        ...armoryNewsCache.events,
+        ...events
+    ]) {
+        const key =
+            String(
+                event?.id ||
+                `${event?.timestamp || 0}:${event?.text || ""}`
+            );
+
+        map.set(key, event);
+    }
+
+    armoryNewsCache.events =
+        [...map.values()];
+
+    trimArmoryNewsCache();
+}
+
+function sleep(ms) {
+    return new Promise(
+        resolve => setTimeout(resolve, ms)
+    );
+}
+
 function safeArmoryUsageDays(value) {
     const days =
         Number(value || 30);
@@ -4303,6 +4428,12 @@ async function fetchFactionArmoryUseHistory(
             getTornNextNewsUrl(
                 data
             );
+
+        // The one-time historical bootstrap can span dozens of pages.
+        // Pace it instead of bursting Torn's API.
+        if (nextUrl) {
+            await sleep(1100);
+        }
     }
 
     rows.sort(
@@ -4323,6 +4454,254 @@ async function fetchFactionArmoryUseHistory(
 }
 
 
+
+function summarizeCachedArmoryUsage(days) {
+    const now =
+        Math.floor(Date.now() / 1000);
+    const from =
+        now - days * 24 * 60 * 60;
+
+    const events =
+        armoryNewsCache.events.filter(
+            event => {
+                const ts =
+                    Number(event?.timestamp || 0);
+                return ts >= from && ts <= now;
+            }
+        );
+
+    const categoryMap =
+        latestArmoryCategoryMap();
+    const itemMap = new Map();
+    const memberMap = new Map();
+    const categories = {
+        drugs: 0,
+        medical: 0,
+        temporary: 0,
+        other: 0
+    };
+
+    let totalUsed = 0;
+
+    for (const event of events) {
+        const category =
+            inferConsumableCategory(
+                event.itemName,
+                categoryMap
+            );
+        const itemKey =
+            String(event.itemName || "")
+                .trim()
+                .toLowerCase();
+
+        const item =
+            itemMap.get(itemKey) || {
+                name: event.itemName,
+                category,
+                used: 0,
+                events: 0
+            };
+
+        item.used += Number(event.quantity || 1);
+        item.events += 1;
+
+        if (
+            item.category === "other" &&
+            category !== "other"
+        ) {
+            item.category = category;
+        }
+
+        itemMap.set(itemKey, item);
+
+        const actor =
+            event.actor || "Unknown";
+        const member =
+            memberMap.get(actor) || {
+                name: actor,
+                used: 0,
+                xanax: 0
+            };
+
+        member.used += Number(event.quantity || 1);
+
+        if (itemKey === "xanax") {
+            member.xanax += Number(event.quantity || 1);
+        }
+
+        memberMap.set(actor, member);
+
+        totalUsed += Number(event.quantity || 1);
+        categories[
+            Object.prototype.hasOwnProperty.call(categories, category)
+                ? category
+                : "other"
+        ] += Number(event.quantity || 1);
+    }
+
+    const items =
+        [...itemMap.values()].sort(
+            (a, b) =>
+                Number(b.used || 0) -
+                Number(a.used || 0) ||
+                a.name.localeCompare(b.name)
+        );
+
+    const members =
+        [...memberMap.values()].sort(
+            (a, b) =>
+                Number(b.xanax || 0) -
+                Number(a.xanax || 0) ||
+                Number(b.used || 0) -
+                Number(a.used || 0) ||
+                a.name.localeCompare(b.name)
+        );
+
+    const xanax =
+        items.find(
+            item =>
+                String(item.name || "")
+                    .trim()
+                    .toLowerCase() === "xanax"
+        )?.used || 0;
+
+    return {
+        available: true,
+        source: "micc-cached-torn-armory-news",
+        cached: true,
+        days,
+        from,
+        to: now,
+        rawNewsCount: events.length,
+        pagesRead: 0,
+        parsedUseEvents: events.length,
+        totalUsed,
+        xanax,
+        categories,
+        items,
+        members,
+        lastSuccessfulSync:
+            armoryNewsCache.lastSuccessfulSync,
+        staleBecause:
+            armoryNewsCache.lastError || ""
+    };
+}
+
+async function syncArmoryNewsCache() {
+    if (
+        armoryNewsSyncBusy ||
+        !tornFactionApiConfigured()
+    ) {
+        return;
+    }
+
+    const nowMs = Date.now();
+
+    if (
+        !armoryNewsCache.initialized &&
+        armoryNewsCache.lastAttempt &&
+        nowMs - armoryNewsCache.lastAttempt <
+            ARMORY_NEWS_BOOTSTRAP_RETRY_MS
+    ) {
+        return;
+    }
+
+    armoryNewsSyncBusy = true;
+    armoryNewsCache.lastAttempt = nowMs;
+
+    try {
+        const now =
+            Math.floor(Date.now() / 1000);
+
+        let from;
+
+        if (armoryNewsCache.initialized) {
+            const newest =
+                armoryNewsCache.events.reduce(
+                    (max, event) =>
+                        Math.max(
+                            max,
+                            Number(event?.timestamp || 0)
+                        ),
+                    0
+                );
+
+            // Small overlap protects same-second pagination boundaries.
+            from =
+                Math.max(
+                    now - ARMORY_NEWS_RETENTION_SECONDS,
+                    (newest || now - 3600) - 120
+                );
+        } else {
+            // One historical baseline. After this succeeds, future syncs
+            // only request new events.
+            from =
+                now -
+                ARMORY_NEWS_RETENTION_SECONDS;
+        }
+
+        const days =
+            Math.max(
+                1,
+                Math.ceil(
+                    (now - from) /
+                    (24 * 60 * 60)
+                )
+            );
+
+        const history =
+            await fetchFactionArmoryUseHistory(days);
+
+        const parsed =
+            history.news
+                .filter(
+                    entry =>
+                        Number(entry?.timestamp || 0) >= from
+                )
+                .map(parseFactionArmoryUseNews)
+                .filter(Boolean);
+
+        mergeArmoryNewsEvents(parsed);
+
+        armoryNewsCache.initialized = true;
+        armoryNewsCache.lastSuccessfulSync = Date.now();
+        armoryNewsCache.lastError = "";
+        saveArmoryNewsCache();
+
+        console.log(
+            `[MICC] Armory news cache synced: ${parsed.length} used events; ${armoryNewsCache.events.length} retained.`
+        );
+    } catch (error) {
+        armoryNewsCache.lastError =
+            String(
+                error?.message ||
+                "Torn armory news sync failed"
+            );
+
+        // Keep the last successful cache. Never blank the UI on a rate limit.
+        saveArmoryNewsCache();
+
+        console.error(
+            "[MICC] Armory news sync failed; serving last good cache:",
+            armoryNewsCache.lastError
+        );
+    } finally {
+        armoryNewsSyncBusy = false;
+    }
+}
+
+// Build/update in the background. Opening MICC no longer triggers the
+// expensive historical Torn request.
+setTimeout(
+    () => syncArmoryNewsCache(),
+    5000
+);
+
+setInterval(
+    () => syncArmoryNewsCache(),
+    ARMORY_NEWS_SYNC_MS
+);
+
 app.get(
     "/api/micc/armory/news-usage",
     auth,
@@ -4330,7 +4709,7 @@ app.get(
         if (!tornFactionApiConfigured()) {
             return res.json({
                 available: false,
-                source: "torn-faction-news",
+                source: "micc-armory-cache",
                 reason:
                     "TORN_FACTION_API_KEY is not configured on the MICC server."
             });
@@ -4341,178 +4720,25 @@ app.get(
                 req.query?.days
             );
 
-        try {
-            const history =
-                await fetchFactionArmoryUseHistory(
-                    days
-                );
+        if (!armoryNewsCache.initialized) {
+            // Start/retry bootstrap in background, but do not make the
+            // browser wait through dozens of Torn API pages.
+            syncArmoryNewsCache();
 
-            const categoryMap =
-                latestArmoryCategoryMap();
-
-            const parsed =
-                history.news
-                    .map(
-                        parseFactionArmoryUseNews
-                    )
-                    .filter(Boolean);
-
-            const itemMap =
-                new Map();
-
-            const memberMap =
-                new Map();
-
-            let totalUsed = 0;
-
-            const categories = {
-                drugs: 0,
-                medical: 0,
-                temporary: 0,
-                other: 0
-            };
-
-            for (const event of parsed) {
-                const category =
-                    inferConsumableCategory(
-                        event.itemName,
-                        categoryMap
-                    );
-
-                const itemKey =
-                    event.itemName
-                        .trim()
-                        .toLowerCase();
-
-                const item =
-                    itemMap.get(itemKey) || {
-                        name:
-                            event.itemName,
-                        category,
-                        used: 0,
-                        events: 0
-                    };
-
-                item.used +=
-                    event.quantity;
-                item.events += 1;
-
-                if (
-                    item.category === "other" &&
-                    category !== "other"
-                ) {
-                    item.category =
-                        category;
-                }
-
-                itemMap.set(
-                    itemKey,
-                    item
-                );
-
-                const actor =
-                    event.actor || "Unknown";
-
-                const member =
-                    memberMap.get(actor) || {
-                        name: actor,
-                        used: 0,
-                        xanax: 0
-                    };
-
-                member.used +=
-                    event.quantity;
-
-                if (
-                    itemKey === "xanax"
-                ) {
-                    member.xanax +=
-                        event.quantity;
-                }
-
-                memberMap.set(
-                    actor,
-                    member
-                );
-
-                totalUsed +=
-                    event.quantity;
-
-                categories[
-                    Object.prototype.hasOwnProperty.call(
-                        categories,
-                        category
-                    )
-                        ? category
-                        : "other"
-                ] +=
-                    event.quantity;
-            }
-
-            const items =
-                [...itemMap.values()]
-                    .sort(
-                        (a, b) =>
-                            Number(b.used || 0) -
-                            Number(a.used || 0) ||
-                            a.name.localeCompare(b.name)
-                    );
-
-            const members =
-                [...memberMap.values()]
-                    .sort(
-                        (a, b) =>
-                            Number(b.xanax || 0) -
-                            Number(a.xanax || 0) ||
-                            Number(b.used || 0) -
-                            Number(a.used || 0) ||
-                            a.name.localeCompare(b.name)
-                    );
-
-            const xanax =
-                items.find(
-                    item =>
-                        item.name
-                            .trim()
-                            .toLowerCase() ===
-                        "xanax"
-                )?.used || 0;
-
-            return res.json({
-                available: true,
-                source:
-                    "torn-faction-news",
-                days,
-                from:
-                    history.start,
-                to:
-                    history.end,
-                rawNewsCount:
-                    history.news.length,
-                pagesRead:
-                    history.pageCount || 0,
-                parsedUseEvents:
-                    parsed.length,
-                totalUsed,
-                xanax,
-                categories,
-                items,
-                members
-            });
-
-        } catch (error) {
             return res.json({
                 available: false,
-                source:
-                    "torn-faction-news",
+                source: "micc-armory-cache",
+                building: true,
                 reason:
-                    error?.message ||
-                    "Torn faction armory news request failed.",
-                code:
-                    error?.tornData?.error?.code ??
-                    null
+                    armoryNewsCache.lastError
+                        ? `MICC is building its saved armory history. Last Torn response: ${armoryNewsCache.lastError}`
+                        : "MICC is building its saved armory history from Torn."
             });
         }
+
+        return res.json(
+            summarizeCachedArmoryUsage(days)
+        );
     }
 );
 
