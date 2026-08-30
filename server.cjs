@@ -2524,7 +2524,7 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.13",
+        version: "0.9.14",
         members: Object.keys(database).length,
         message: "MICC relay is online"
     });
@@ -5171,36 +5171,6 @@ app.get(
 // JSON 404
 // ============================================================
 
-app.use((req, res) => {
-    res.status(404).json({
-        success: false,
-        error: "MICC route not found",
-        method: req.method,
-        path: req.path
-    });
-});
-
-// ============================================================
-// ERROR HANDLER
-// ============================================================
-
-app.use((error, req, res, next) => {
-    console.error(
-        "[MICC] Server error:",
-        error
-    );
-
-    res.status(500).json({
-        success: false,
-        error: "MICC server error"
-    });
-});
-
-// ============================================================
-// START SERVER
-// ============================================================
-
-
 // ============================================================
 // FFSCOUTER PLAYER FLIGHTS (PREMIUM)
 // Keeps the FFScouter API key server-side.
@@ -5357,6 +5327,37 @@ app.get(
         }
     }
 );
+
+
+
+app.use((req, res) => {
+    res.status(404).json({
+        success: false,
+        error: "MICC route not found",
+        method: req.method,
+        path: req.path
+    });
+});
+
+// ============================================================
+// ERROR HANDLER
+// ============================================================
+
+app.use((error, req, res, next) => {
+    console.error(
+        "[MICC] Server error:",
+        error
+    );
+
+    res.status(500).json({
+        success: false,
+        error: "MICC server error"
+    });
+});
+
+// ============================================================
+// START SERVER
+// ============================================================
 
 
 app.listen(PORT, () => {
