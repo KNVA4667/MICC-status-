@@ -2,6 +2,8 @@ const express = require("express");
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const http = require("http");
+const { WebSocketServer, WebSocket } = require("ws");
 
 // ============================================================
 // MICC FACTION STATUS RELAY
@@ -9,6 +11,15 @@ const crypto = require("crypto");
 // ============================================================
 
 const app = express();
+const server = http.createServer(app);
+
+const liveWss =
+    new WebSocketServer({
+        noServer: true
+    });
+
+const liveClients =
+    new Set();
 
 const PORT = process.env.PORT || 3002;
 
@@ -2496,6 +2507,154 @@ function requireCalendarOwner(
 }
 
 // ============================================================
+// MICC LIVE RELAY — WEBSOCKET
+// ============================================================
+
+function getLiveSnapshot() {
+    const now =
+        Date.now();
+
+    return Object
+        .values(database)
+        .filter(
+            member =>
+                member?.updated &&
+                now -
+                    Number(member.updated) <=
+                    MAX_STATUS_AGE
+        );
+}
+
+function sendLiveJson(
+    socket,
+    payload
+) {
+    if (
+        socket.readyState !==
+        WebSocket.OPEN
+    ) {
+        return;
+    }
+
+    try {
+        socket.send(
+            JSON.stringify(
+                payload
+            )
+        );
+    } catch {}
+}
+
+function broadcastLive(
+    payload
+) {
+    for (
+        const socket of
+            liveClients
+    ) {
+        sendLiveJson(
+            socket,
+            payload
+        );
+    }
+}
+
+liveWss.on(
+    "connection",
+    socket => {
+        liveClients.add(
+            socket
+        );
+
+        sendLiveJson(
+            socket,
+            {
+                type: "snapshot",
+                members:
+                    getLiveSnapshot(),
+                serverTime:
+                    Date.now()
+            }
+        );
+
+        socket.on(
+            "close",
+            () => {
+                liveClients.delete(
+                    socket
+                );
+            }
+        );
+
+        socket.on(
+            "error",
+            () => {
+                liveClients.delete(
+                    socket
+                );
+            }
+        );
+    }
+);
+
+server.on(
+    "upgrade",
+    (req, socket, head) => {
+        let url = null;
+
+        try {
+            url =
+                new URL(
+                    req.url,
+                    "http://localhost"
+                );
+        } catch {
+            socket.destroy();
+            return;
+        }
+
+        if (
+            url.pathname !==
+            "/api/micc/live"
+        ) {
+            socket.destroy();
+            return;
+        }
+
+        const suppliedSecret =
+            String(
+                url.searchParams.get(
+                    "secret"
+                ) || ""
+            );
+
+        if (
+            !suppliedSecret ||
+            suppliedSecret !== MICC_SECRET
+        ) {
+            socket.write(
+                "HTTP/1.1 403 Forbidden\\r\\n\\r\\n"
+            );
+            socket.destroy();
+            return;
+        }
+
+        liveWss.handleUpgrade(
+            req,
+            socket,
+            head,
+            ws => {
+                liveWss.emit(
+                    "connection",
+                    ws,
+                    req
+                );
+            }
+        );
+    }
+);
+
+// ============================================================
 // AUTHENTICATION
 // ============================================================
 
@@ -2524,8 +2683,10 @@ app.get("/", (req, res) => {
     res.json({
         success: true,
         service: "MICC Faction Status Relay",
-        version: "0.9.14",
+        version: "0.10.0",
         members: Object.keys(database).length,
+        liveClients: liveClients.size,
+        liveCore: true,
         message: "MICC relay is online"
     });
 });
@@ -2579,6 +2740,15 @@ app.post(
         };
 
         saveDatabase();
+
+        // Push only this changed member to every connected MICC client.
+        broadcastLive({
+            type: "status",
+            member:
+                database[id],
+            serverTime:
+                Date.now()
+        });
 
         console.log(
             `[MICC] Updated ${name} [${playerId}]`
@@ -2634,6 +2804,14 @@ app.get(
             ) {
                 delete database[id];
                 databaseChanged = true;
+
+                broadcastLive({
+                    type: "remove",
+                    playerId:
+                        Number(id),
+                    serverTime:
+                        Date.now()
+                });
 
                 console.log(
                     `[MICC] Removed stale member ${id}`
@@ -5360,7 +5538,7 @@ app.use((error, req, res, next) => {
 // ============================================================
 
 
-app.listen(PORT, () => {
+server.listen(PORT, () => {
     console.log("");
     console.log("======================================");
     console.log("       MICC Faction Status Relay");
@@ -5372,6 +5550,7 @@ app.listen(PORT, () => {
     console.log("  GET  /");
     console.log("  GET  /api/micc/status");
     console.log("  POST /api/micc/status");
+    console.log("  WS   /api/micc/live");
     console.log("  GET  /api/micc/calendar");
     console.log("  POST /api/micc/calendar/event");
     console.log("  POST /api/micc/calendar/note");
